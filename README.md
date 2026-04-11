@@ -59,7 +59,9 @@ cp .env.example .env
 # Edit .env — fill in TELEGRAM_BOT_TOKEN and ALLOWED_USER_IDS
 
 # 4. (Optional) Customise your assistant's personality
+cp soul.example.md soul.md
 # Edit soul.md — set a name, tone, and context for your assistant
+# soul.md is gitignored — your personal config stays private
 
 # 5. Run
 python3 src/bridge.py
@@ -95,7 +97,13 @@ Find your Telegram user ID by messaging [@userinfobot](https://t.me/userinfobot)
 
 ## Personality — soul.md
 
-The `soul.md` file defines your assistant's identity, tone, and context. It is loaded at startup and injected as a system prompt into every Claude session.
+The `soul.md` file defines your assistant's identity, tone, and context. It is loaded at startup and injected as a system prompt into every Claude session. It is **gitignored** — your personal config never gets committed.
+
+Copy the template to get started:
+
+```bash
+cp soul.example.md soul.md
+```
 
 Edit `soul.md` to:
 - Give your assistant a name
@@ -148,7 +156,8 @@ cc-telegram-bridge/
 ├── docs/
 │   ├── ARCHITECTURE.md    # System design and message flow
 │   └── TOOLS.md           # Claude's built-in tool use
-├── soul.md                # Assistant personality and identity (edit this)
+├── soul.example.md        # Personality template — copy to soul.md and fill in
+├── soul.md                # Your personal assistant config (gitignored)
 ├── data/                  # SQLite database (gitignored)
 ├── logs/                  # Log files (gitignored)
 ├── .env.example           # Configuration template (fill in and copy to .env)

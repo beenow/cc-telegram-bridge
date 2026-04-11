@@ -2,6 +2,9 @@
 .env
 .envrc
 
+# Personal / private
+soul.md
+
 # Runtime data
 data/
 logs/
