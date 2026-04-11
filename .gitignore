@@ -1,5 +1,6 @@
 # Environment & secrets
 .env
+.envrc
 
 # Runtime data
 data/
@@ -8,11 +9,17 @@ logs/
 # Python
 __pycache__/
 *.py[cod]
+*.so
 .venv/
 venv/
+env/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
 
 # macOS
 .DS_Store
@@ -21,3 +28,5 @@ build/
 .vscode/
 .idea/
 *.swp
+.cursorignore
+.cursorindexingignore
