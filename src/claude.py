@@ -9,13 +9,19 @@ No Anthropic API key needed — uses your existing Claude Code subscription.
 import asyncio
 import json
 import logging
+import shutil
 import uuid
 from dataclasses import dataclass
 from typing import AsyncIterator
 
 log = logging.getLogger(__name__)
 
-CLAUDE_BIN = "/Users/bullabear/.local/bin/claude"
+# Resolve `claude` from PATH; fall back to common install locations.
+CLAUDE_BIN = (
+    shutil.which("claude")
+    or shutil.which("claude", path="/usr/local/bin:/opt/homebrew/bin")
+    or "claude"
+)
 MAX_TOOL_ROUNDS = 10  # safety cap (claude CLI handles tools internally, but just in case)
 
 
@@ -65,10 +71,15 @@ class ClaudeClient:
         log.info(f"Running: {' '.join(cmd[:6])}...")
 
         try:
+            # Claude CLI can emit very large JSON lines (tool outputs, long context).
+            # Default asyncio StreamReader limit is 64KB — increase to 10MB to avoid
+            # LimitOverrunError / ValueError crashes on large responses.
+            _STREAM_LIMIT = 10 * 1024 * 1024  # 10 MB
             self._proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=_STREAM_LIMIT,
             )
             proc = self._proc
 
@@ -113,7 +124,7 @@ class ClaudeClient:
         except asyncio.TimeoutError:
             yield StreamChunk(error=f"Claude timed out after {self._timeout}s")
         except FileNotFoundError:
-            yield StreamChunk(error=f"Claude CLI not found at {CLAUDE_BIN}. Is Claude Code installed?")
+            yield StreamChunk(error=f"Claude CLI not found ({CLAUDE_BIN}). Is Claude Code installed and on PATH?")
         except Exception as e:
             log.exception("Unexpected error running Claude CLI")
             yield StreamChunk(error=f"Error: {type(e).__name__}: {e}")
