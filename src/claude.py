@@ -80,6 +80,10 @@ class ClaudeClient:
         cmd = self._build_command(prompt, session_id, is_new_session)
         log.info(f"Running: {' '.join(cmd[:6])}...")
 
+        # Declared outside try so except blocks can always reference them safely.
+        got_first_byte = False
+        proc = None
+
         try:
             # Claude CLI can emit very large JSON lines (tool outputs, long context).
             # Default asyncio StreamReader limit is 64KB — increase to 10MB to avoid
@@ -94,7 +98,6 @@ class ClaudeClient:
             proc = self._proc
 
             full_text = ""
-            got_first_byte = False
             deadline = asyncio.get_event_loop().time() + self._timeout
 
             while True:
@@ -136,16 +139,17 @@ class ClaudeClient:
                 if chunk.done:
                     break
 
-            # Drain stderr for logging
-            stderr = await proc.stderr.read()
-            if stderr:
-                log.debug(f"claude stderr: {stderr.decode('utf-8', errors='replace')[:500]}")
+            # Drain stderr for error surfacing and logging.
+            stderr_bytes = await proc.stderr.read()
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                log.debug(f"claude stderr: {stderr_text[:500]}")
 
             await proc.wait()
 
             if proc.returncode not in (0, None):
-                err = stderr.decode("utf-8", errors="replace").strip()
-                yield StreamChunk(error=f"Claude exited with code {proc.returncode}: {err[:300]}")
+                log.warning(f"claude exited {proc.returncode}: {stderr_text[:200]}")
+                yield StreamChunk(error=f"Claude error (rc={proc.returncode}): {stderr_text[:300] or 'unknown'}")
                 return
 
             yield StreamChunk(done=True)

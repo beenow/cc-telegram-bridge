@@ -259,8 +259,34 @@ async def _handle_message(
 
     thinking_task = asyncio.create_task(_animate_thinking())
 
+    async def _stream_with_session_recovery():
+        """
+        Stream from Claude, auto-recovering if the session no longer exists.
+        On 'No conversation found' error, resets the DB session and retries once
+        with a fresh session ID — transparent to the user.
+        """
+        nonlocal session_id, is_new
+
+        async def _do_stream():
+            async for chunk in claude.stream(user_text, session_id, is_new):
+                yield chunk
+
+        first_error = None
+        async for chunk in _do_stream():
+            if chunk.error and "no conversation found" in chunk.error.lower() and not is_new:
+                # Session missing from Claude's local store — reset and retry once.
+                log.warning(f"Session {session_id} not found, resetting and retrying...")
+                db.reset_session(chat_id)
+                session_id = claude.new_session_id()
+                db.set_claude_session_id(chat_id, session_id)
+                is_new = True
+                async for retry_chunk in claude.stream(user_text, session_id, is_new):
+                    yield retry_chunk
+                return
+            yield chunk
+
     try:
-        async for chunk in claude.stream(user_text, session_id, is_new):
+        async for chunk in _stream_with_session_recovery():
             if chunk.error:
                 await ctx.bot.edit_message_text(
                     chat_id=chat_id,
