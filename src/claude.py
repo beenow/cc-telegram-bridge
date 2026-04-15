@@ -24,6 +24,10 @@ CLAUDE_BIN = (
 )
 MAX_TOOL_ROUNDS = 10  # safety cap (claude CLI handles tools internally, but just in case)
 
+# Tight deadline to receive the first byte from the subprocess.
+# Catches stale --resume sessions that hang while loading large history.
+FIRST_BYTE_TIMEOUT = 30  # seconds
+
 
 @dataclass
 class StreamChunk:
@@ -66,6 +70,12 @@ class ClaudeClient:
         - Subsequent messages: uses --resume <uuid> to continue the same session
 
         Yields StreamChunk objects with incremental text.
+
+        Timeouts:
+        - FIRST_BYTE_TIMEOUT (30s): if no output at all within 30s, the subprocess
+          is killed and an error is yielded. Catches stale --resume hangs where the
+          CLI is loading a large/corrupt history and never starts responding.
+        - self._timeout: total wall-clock cap for the entire response.
         """
         cmd = self._build_command(prompt, session_id, is_new_session)
         log.info(f"Running: {' '.join(cmd[:6])}...")
@@ -84,8 +94,30 @@ class ClaudeClient:
             proc = self._proc
 
             full_text = ""
-            async for line in proc.stdout:
-                line = line.decode("utf-8", errors="replace").strip()
+            got_first_byte = False
+            deadline = asyncio.get_event_loop().time() + self._timeout
+
+            while True:
+                # Choose timeout: tight first-byte window until we get output, then total deadline.
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+
+                wait = FIRST_BYTE_TIMEOUT if not got_first_byte else min(remaining, 60)
+
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=wait)
+                except asyncio.TimeoutError:
+                    if not got_first_byte:
+                        raise asyncio.TimeoutError()  # re-raise as first-byte timeout
+                    # Mid-stream timeout — process is just slow, keep waiting up to deadline
+                    continue
+
+                if not raw:
+                    break  # EOF
+
+                got_first_byte = True
+                line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
 
@@ -122,7 +154,11 @@ class ClaudeClient:
             self.cancel()
             raise
         except asyncio.TimeoutError:
-            yield StreamChunk(error=f"Claude timed out after {self._timeout}s")
+            self.cancel()
+            if not got_first_byte:
+                yield StreamChunk(error=f"Claude did not respond within {FIRST_BYTE_TIMEOUT}s — session may be stale. Send /new to reset.")
+            else:
+                yield StreamChunk(error=f"Claude timed out after {self._timeout}s")
         except FileNotFoundError:
             yield StreamChunk(error=f"Claude CLI not found ({CLAUDE_BIN}). Is Claude Code installed and on PATH?")
         except Exception as e:
