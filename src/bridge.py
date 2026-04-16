@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from telegram import Update, constants
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -380,10 +381,13 @@ def setup_logging(log_dir: str, log_level: str):
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(str(Path(log_dir) / "bridge.log")),
     ]
+    # force=True removes any handlers already on the root logger (prevents
+    # duplicate log lines when the process is restarted by launchd).
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=handlers,
+        force=True,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -415,6 +419,17 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Log errors; on RetryAfter sleep the required time instead of crashing."""
+        err = ctx.error
+        if isinstance(err, RetryAfter):
+            log.warning(f"Telegram flood control: sleeping {err.retry_after}s")
+            await asyncio.sleep(err.retry_after)
+            return
+        log.exception("Unhandled telegram error", exc_info=err)
+
+    app.add_error_handler(_error_handler)
 
     log.info("Starting Telegram polling...")
     app.run_polling(drop_pending_updates=True)
