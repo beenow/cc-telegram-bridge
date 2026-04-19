@@ -22,6 +22,9 @@ cc-telegram-bridge is a thin relay. It receives your Telegram message, passes it
 - **Persistent memory** — Claude Code remembers your conversation across restarts using its native session system
 - **Streaming replies** — Claude's response appears progressively, edited in-place as it generates
 - **Animated thinking indicator** — "3 is thinking ." cycles up to 50 dots while waiting for the first response chunk
+- **ACK reactions** — bot reacts 👀 on receipt and ✅ when the reply completes, so you can see at a glance which messages were handled
+- **Attachments** — send a photo, document, audio file, voice note, or video; the bridge saves it to `downloads/` and tells Claude the path, so Claude's native file tools can read/transcribe/analyze it
+- **Inline model picker** — `/model` with no argument shows one-tap buttons for `sonnet` / `opus` / `haiku`
 - **Message steering** — send a new message while Claude is responding to instantly cancel and redirect (no queue buildup)
 - **Long response splitting** — responses over Telegram's 4096-char limit are automatically split across multiple messages
 - **Soul / personality layer** — define your assistant's name, tone, and context in `soul.md` — loaded at startup, no code changes needed
@@ -83,9 +86,10 @@ ALLOWED_USER_IDS=123456789        # Comma-separated Telegram user IDs
 
 # Optional
 DEFAULT_MODEL=sonnet              # sonnet | opus | haiku
-COMMAND_TIMEOUT_SECS=120          # Max seconds for Claude CLI calls
+COMMAND_TIMEOUT_SECS=600          # Max seconds for Claude CLI calls
 DATA_DIR=./data                   # SQLite database location
 LOG_DIR=./logs
+DOWNLOADS_DIR=./downloads         # Where inbound attachments are saved (gitignored)
 LOG_LEVEL=INFO
 ```
 
@@ -135,9 +139,32 @@ This means no queue buildup — your latest message always wins.
 |---|---|
 | `/start` | Introduction and help |
 | `/new` | Start a fresh conversation (clears session) |
-| `/model <name>` | Switch model — `sonnet`, `opus`, or `haiku` |
+| `/model` | Show one-tap inline keyboard to switch model |
+| `/model <name>` | Switch model directly — `sonnet`, `opus`, or `haiku` |
 | `/status` | Show current session info (model, message count, session ID) |
 | `/help` | Show all commands |
+
+Commands are registered with Telegram via `setMyCommands` on startup, so they show up in the `/` picker in the chat.
+
+---
+
+## Attachments
+
+Send a photo, document, PDF, audio file, voice note, or video alongside (or without) a caption and the bridge will:
+
+1. Download the file to `downloads/` with the pattern `{chat_id}_{timestamp}_{message_id}_{sanitized_filename}`.
+2. Prepend a short block to your prompt telling Claude where the file lives on disk:
+
+   ```
+   [Attachments available on disk — use your Read/file tools to inspect them:]
+     - photo: /abs/path/downloads/12345_1712345678_42_photo_abc123.jpg
+
+   <your caption here>
+   ```
+
+3. Claude's normal file tools (Read, Bash, etc.) can then open, transcribe, or analyze the file — no Vision-API plumbing needed; the CLI already knows how to handle files on disk.
+
+`downloads/` is gitignored. No cloud upload is involved — everything stays on your machine.
 
 ---
 
@@ -160,6 +187,7 @@ cc-telegram-bridge/
 ├── soul.md                # Your personal assistant config (gitignored)
 ├── data/                  # SQLite database (gitignored)
 ├── logs/                  # Log files (gitignored)
+├── downloads/             # Inbound attachments from Telegram (gitignored)
 ├── .env.example           # Configuration template (fill in and copy to .env)
 ├── .env                   # Your local config (gitignored — never commit this)
 ├── requirements.txt       # Python dependencies
@@ -242,8 +270,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 
 ## Roadmap
 
-- [ ] Voice message support (Whisper transcription → Claude)
-- [ ] Image understanding (send photo → Claude Vision)
+- [x] Image understanding (send photo → Claude reads it from disk)
+- [x] Document attachments (PDF / text / audio / video via Claude's file tools)
+- [x] One-tap `/model` picker
+- [ ] Voice message transcription (right now voice notes are passed through as `.ogg` files — Claude can inspect but not natively transcribe without a tool)
 - [ ] Scheduled messages / reminders via Telegram
 - [ ] `/stop` command to cancel the current response without sending a new one
 - [ ] Docker support

@@ -7,14 +7,23 @@ Run with:
 
 import asyncio
 import logging
+import re
 import sys
 import time
 from pathlib import Path
 
-from telegram import BotCommand, ReactionTypeEmoji, Update, constants
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReactionTypeEmoji,
+    Update,
+    constants,
+)
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -47,6 +56,82 @@ async def _set_reaction(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id
         )
     except Exception as e:
         log.debug(f"set_message_reaction failed: {e}")
+
+
+_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_filename(name: str) -> str:
+    """Strip any path components and unsafe chars from a user-supplied filename."""
+    name = Path(name).name  # drop directories
+    name = _FILENAME_SAFE.sub("_", name).strip("._")
+    return name or "file"
+
+
+async def _download_attachments(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    downloads_dir: Path,
+) -> list[tuple[Path, str]]:
+    """
+    Download any media on the incoming message to `downloads_dir` and return
+    [(absolute_path, kind), ...]. Claude CLI doesn't accept file paths in
+    --print mode, so we inject the paths into the prompt text instead.
+    """
+    msg = update.message
+    if msg is None:
+        return []
+
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    chat_id = update.effective_chat.id
+    ts = int(time.time())
+    prefix = f"{chat_id}_{ts}_{msg.message_id}"
+
+    results: list[tuple[Path, str]] = []
+
+    async def _save(file_obj, filename: str, kind: str):
+        dest = downloads_dir / f"{prefix}_{_sanitize_filename(filename)}"
+        try:
+            tg_file = await file_obj.get_file()
+            await tg_file.download_to_drive(custom_path=str(dest))
+            results.append((dest.resolve(), kind))
+        except Exception as e:
+            log.warning(f"Failed to download {kind} {filename}: {e}")
+
+    if msg.photo:
+        # Highest-resolution PhotoSize is last in the list.
+        photo = msg.photo[-1]
+        await _save(photo, f"photo_{photo.file_unique_id}.jpg", "photo")
+    if msg.document:
+        await _save(msg.document, msg.document.file_name or "document.bin", "document")
+    if msg.video:
+        await _save(msg.video, msg.video.file_name or "video.mp4", "video")
+    if msg.audio:
+        await _save(msg.audio, msg.audio.file_name or "audio.mp3", "audio")
+    if msg.voice:
+        await _save(msg.voice, f"voice_{msg.voice.file_unique_id}.ogg", "voice")
+    if msg.video_note:
+        await _save(msg.video_note, f"video_note_{msg.video_note.file_unique_id}.mp4", "video_note")
+
+    return results
+
+
+def _build_prompt_with_attachments(
+    caption: str,
+    attachments: list[tuple[Path, str]],
+) -> str:
+    """
+    Prepend a block that tells Claude where to find the attached files.
+    The CLI can Read/open these paths via its normal tools.
+    """
+    if not attachments:
+        return caption
+    lines = ["[Attachments available on disk — use your Read/file tools to inspect them:]"]
+    for path, kind in attachments:
+        lines.append(f"  - {kind}: {path}")
+    lines.append("")
+    lines.append(caption if caption else "(no accompanying text — please examine the attachment above)")
+    return "\n".join(lines)
 
 
 async def _cancel_active(chat_id: int):
@@ -113,6 +198,21 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=constants.ParseMode.MARKDOWN)
 
 
+VALID_MODELS = ["sonnet", "opus", "haiku"]
+
+
+def _model_keyboard(current: str) -> InlineKeyboardMarkup:
+    """One-tap model picker. Current model gets a ● marker."""
+    row = [
+        InlineKeyboardButton(
+            ("● " if m == current else "") + m,
+            callback_data=f"model:{m}",
+        )
+        for m in VALID_MODELS
+    ]
+    return InlineKeyboardMarkup([row])
+
+
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Config = ctx.bot_data["config"]
     db: Database = ctx.bot_data["db"]
@@ -121,27 +221,58 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     args = ctx.args
 
-    valid_models = ["sonnet", "opus", "haiku"]
+    session = db.get_session(chat_id, cfg.default_model, False)
 
     if not args:
-        session = db.get_session(chat_id, cfg.default_model, False)
-        options = ", ".join(f"`{m}`" for m in valid_models)
         await update.message.reply_text(
-            f"Current model: `{session['model']}`\n\nAvailable: {options}\n\nUse `/model sonnet` to switch.",
+            f"Current model: `{session['model']}`\n\nTap to switch:",
             parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=_model_keyboard(session["model"]),
         )
         return
 
     model = args[0].strip().lower()
-    if model not in valid_models:
+    if model not in VALID_MODELS:
         await update.message.reply_text(
-            f"Unknown model: `{model}`\n\nAvailable: " + ", ".join(f"`{m}`" for m in valid_models),
+            f"Unknown model: `{model}`\n\nAvailable: " + ", ".join(f"`{m}`" for m in VALID_MODELS),
             parse_mode=constants.ParseMode.MARKDOWN,
         )
         return
 
     db.set_model(chat_id, model)
     await update.message.reply_text(f"Model switched to `{model}`", parse_mode=constants.ParseMode.MARKDOWN)
+
+
+async def cb_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = ctx.bot_data["config"]
+    db: Database = ctx.bot_data["db"]
+    query = update.callback_query
+    if query is None:
+        return
+    if not _is_allowed(update, cfg):
+        await query.answer("Not authorized.", show_alert=False)
+        return
+
+    data = query.data or ""
+    if not data.startswith("model:"):
+        await query.answer()
+        return
+    model = data.split(":", 1)[1].strip().lower()
+    if model not in VALID_MODELS:
+        await query.answer(f"Unknown model: {model}", show_alert=False)
+        return
+
+    chat_id = update.effective_chat.id
+    db.set_model(chat_id, model)
+    await query.answer(f"Model: {model}")
+    try:
+        await query.edit_message_text(
+            f"Model switched to `{model}`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=_model_keyboard(model),
+        )
+    except BadRequest:
+        pass  # message_not_modified or too old — answer() already confirmed
 
 
 # ── Message handler ──────────────────────────────────────────────────────────
@@ -175,12 +306,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.warning(f"Rejected message from user {update.effective_user.id}")
         return
 
-    text = update.message.text
-    if not text:
+    msg = update.message
+    if msg is None:
         return
 
+    # Text body is either .text (pure text) or .caption (media with caption).
+    text = (msg.text or msg.caption or "").strip()
+
     chat_id = update.effective_chat.id
-    user_msg_id = update.message.message_id
+    user_msg_id = msg.message_id
 
     # Cancel any in-progress response for this chat (steering)
     await _cancel_active(chat_id)
@@ -188,7 +322,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ACK: eyeballs on the user's message while we work on it.
     await _set_reaction(ctx, chat_id, user_msg_id, ACK_RECEIVED)
 
-    task = asyncio.create_task(_handle_message(update, ctx, chat_id, text))
+    # Download any attachments; inject their paths into the prompt so the
+    # Claude CLI (which can't take attachments in --print mode) can Read them.
+    attachments = await _download_attachments(update, ctx, Path(cfg.downloads_dir))
+    if not text and not attachments:
+        return  # nothing to send
+
+    prompt = _build_prompt_with_attachments(text, attachments)
+
+    task = asyncio.create_task(_handle_message(update, ctx, chat_id, prompt))
     _active_tasks[chat_id] = task
     try:
         await task
@@ -470,7 +612,19 @@ def main():
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(CallbackQueryHandler(cb_model, pattern=r"^model:"))
+    # Accept plain text and any captioned/non-captioned media. Commands are
+    # excluded so `/new` etc. still dispatch to their CommandHandlers.
+    media_filter = (
+        filters.TEXT
+        | filters.PHOTO
+        | filters.Document.ALL
+        | filters.VIDEO
+        | filters.AUDIO
+        | filters.VOICE
+        | filters.VIDEO_NOTE
+    )
+    app.add_handler(MessageHandler(media_filter & ~filters.COMMAND, on_message))
 
     async def _post_init(app: Application) -> None:
         # Register commands so they appear in Telegram's `/` picker.

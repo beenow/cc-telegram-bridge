@@ -12,6 +12,7 @@ CLAUDE.md
 # Runtime data
 data/
 logs/
+downloads/
 
 # Python
 __pycache__/

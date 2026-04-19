@@ -177,9 +177,9 @@ Distilled from reviewing a clawdbot checkout. Each pattern is tagged **adopt / a
 - Media groups buffered and reassembled across an album.
 
 **For clawd-bridge:**
-- **Adapt (future):** Claude CLI doesn't natively accept attachment paths in `--print` mode. Inbound images would require copying the file into the session cwd and injecting a reference into the prompt ("image at /tmp/xyz.png — look at it"). Hacky but works.
+- **Done:** `_download_attachments()` saves photo / document / video / audio / voice / video_note into `downloads/{chat_id}_{ts}_{msg_id}_{safe_name}`. `_build_prompt_with_attachments()` prepends a path-listing block so the Claude CLI can open the file via its own Read/Bash tools. `on_message` extracts text from `.text` **or** `.caption`, so a media message with a caption flows through the same streaming path. `downloads/` is gitignored.
 - **Skip:** Media groups — no use case for a single-user Claude frontend.
-- **Skip:** Voice-note opt-in — no audio output path today.
+- **Skip:** Voice-note output — no audio output path today. (Inbound voice notes are saved as `.ogg`; transcription is a future enhancement.)
 
 ## 5. Commands & inline UI
 
@@ -190,7 +190,7 @@ Distilled from reviewing a clawdbot checkout. Each pattern is tagged **adopt / a
 
 **For clawd-bridge:**
 - **Done:** `bot.set_my_commands()` in `post_init` registers `/new`, `/model`, `/status`, `/help` in Telegram's `/` picker.
-- **Consider:** Inline keyboard for `/model` — tap `sonnet` / `opus` / `haiku` instead of typing. CallbackQueryHandler dispatches on `callback_data` strings; keep them ≤64 chars.
+- **Done:** Inline keyboard for `/model` — `/model` with no arg shows `sonnet` / `opus` / `haiku` buttons with a ● on the current. `cb_model` handles the `model:<name>` callback (registered with `pattern=r"^model:"`). Callback data stays well under Telegram's 64-char limit.
 - **Skip:** Per-scope command visibility — single-user.
 
 ## 6. Session persistence & forum topics

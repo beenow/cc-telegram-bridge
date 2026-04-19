@@ -33,6 +33,8 @@ tail -f logs/bridge.log
 - **Conflict / flood-control**: two running instances cause `telegram.error.Conflict`, and a crash-loop under launchd's `KeepAlive` gets the bot `RetryAfter`-banned. The registered error handler catches `RetryAfter` and sleeps instead of dying — don't remove it.
 - **Streaming edits**: reply is a single message edited as chunks arrive. `EDIT_INTERVAL_CHARS=120` and `EDIT_MIN_SECS=0.8` gate edit frequency to avoid hitting Telegram rate limits. Final send splits at `\n` under the 4096-char cap.
 - **Steering**: sending a new message during streaming cancels the prior subprocess and the placeholder is marked `[interrupted]`.
+- **Attachments**: Claude CLI can't take file paths in `--print` mode, so inbound media (photo/document/video/audio/voice/video_note) is downloaded to `downloads/` with filename pattern `{chat_id}_{ts}_{msg_id}_{sanitized_name}`, and the prompt is prefixed with an `[Attachments available on disk — use your Read/file tools...]` block listing the paths. Claude can then open them via its own file tools.
+- **Inline `/model`**: `/model` with no argument shows a one-tap inline keyboard. Callback data is `model:<name>` (≤64 chars). Handled by `cb_model` dispatched on the `^model:` regex.
 
 ## Session lifecycle
 
@@ -43,7 +45,7 @@ tail -f logs/bridge.log
 
 ## Config
 
-`.env` required: `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS` (comma-separated ints — any junk triggers a hard exit). Optional: `DEFAULT_MODEL` (default `sonnet`), `COMMAND_TIMEOUT_SECS` (default 120), `DATA_DIR`, `LOG_DIR`, `LOG_LEVEL`, `TRADING_SYSTEM_ENABLED` + `TRADING_SYSTEM_LOG_DIR` + `TRADING_SYSTEM_CONFIG_PATH`.
+`.env` required: `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS` (comma-separated ints — any junk triggers a hard exit). Optional: `DEFAULT_MODEL` (default `sonnet`), `COMMAND_TIMEOUT_SECS` (default 600), `DATA_DIR`, `LOG_DIR`, `DOWNLOADS_DIR` (default `./downloads`, gitignored), `LOG_LEVEL`, `TRADING_SYSTEM_ENABLED` + `TRADING_SYSTEM_LOG_DIR` + `TRADING_SYSTEM_CONFIG_PATH`.
 
 `soul.md` (gitignored) is prepended to the system prompt. `soul.example.md` is the published template.
 

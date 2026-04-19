@@ -53,6 +53,7 @@ class Config:
     # Paths
     data_dir: str = "./data"
     log_dir: str = "./logs"
+    downloads_dir: str = "./downloads"
     log_level: str = "INFO"
 
     # System prompt appended to Claude's default
@@ -73,6 +74,7 @@ def load_config() -> Config:
     cmd_timeout = _optional_int("COMMAND_TIMEOUT_SECS", 600)
     data_dir = _optional("DATA_DIR", "./data")
     log_dir = _optional("LOG_DIR", "./logs")
+    downloads_dir = _optional("DOWNLOADS_DIR", "./downloads")
     log_level = _optional("LOG_LEVEL", "INFO").upper()
 
     # Trading system integration
@@ -103,6 +105,7 @@ def load_config() -> Config:
         trading_system_config_path=trading_config,
         data_dir=data_dir,
         log_dir=log_dir,
+        downloads_dir=downloads_dir,
         log_level=log_level,
         system_prompt=system_prompt,
     )
