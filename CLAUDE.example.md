@@ -1,5 +1,7 @@
 # clawd-bridge
 
+> **Template note:** This is the committed template. The working `CLAUDE.md` is gitignored so each user can annotate freely without leaking personal info. Keep the two in sync by mirroring generic changes back here; never add paths, tokens, user IDs, or host-specific values to this file.
+
 Telegram bot that fronts the local Claude Code CLI. Each Telegram chat maps to a persistent Claude session; messages are streamed back as edits to a single placeholder reply. No Anthropic API key — uses the Claude CLI subscription.
 
 ## Architecture
@@ -28,7 +30,7 @@ tail -f logs/bridge.log
 
 ## Telegram quirks
 
-- **Conflict / flood-control**: two running instances cause `telegram.error.Conflict`, and a crash-loop under launchd's `KeepAlive` gets the bot `RetryAfter`-banned (we hit a 14h ban on 2026-04-15). The registered error handler catches `RetryAfter` and sleeps instead of dying — don't remove it.
+- **Conflict / flood-control**: two running instances cause `telegram.error.Conflict`, and a crash-loop under launchd's `KeepAlive` gets the bot `RetryAfter`-banned. The registered error handler catches `RetryAfter` and sleeps instead of dying — don't remove it.
 - **Streaming edits**: reply is a single message edited as chunks arrive. `EDIT_INTERVAL_CHARS=120` and `EDIT_MIN_SECS=0.8` gate edit frequency to avoid hitting Telegram rate limits. Final send splits at `\n` under the 4096-char cap.
 - **Steering**: sending a new message during streaming cancels the prior subprocess and the placeholder is marked `[interrupted]`.
 

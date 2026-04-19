@@ -5,6 +5,10 @@
 # Personal / private
 soul.md
 
+# Working copies of docs/skills — templates live in *.example.md
+CLAUDE.md
+.claude/skills/**/SKILL.md
+
 # Runtime data
 data/
 logs/
