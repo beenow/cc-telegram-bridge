@@ -11,8 +11,8 @@ import sys
 import time
 from pathlib import Path
 
-from telegram import Update, constants
-from telegram.error import RetryAfter
+from telegram import BotCommand, ReactionTypeEmoji, Update, constants
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,6 +31,22 @@ log = logging.getLogger(__name__)
 
 # Per-chat active tasks — new message cancels the previous one (steering)
 _active_tasks: dict[int, asyncio.Task] = {}
+
+# ACK reactions: 👀 on receipt, ✅ on success. Silently no-op on failure
+# (Bot API 7.0+ required; older accounts or group-permission issues shouldn't
+# break the reply path).
+ACK_RECEIVED = "👀"
+ACK_DONE = "✅"
+
+
+async def _set_reaction(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, emoji: str | None):
+    try:
+        reaction = [ReactionTypeEmoji(emoji=emoji)] if emoji else []
+        await ctx.bot.set_message_reaction(
+            chat_id=chat_id, message_id=message_id, reaction=reaction
+        )
+    except Exception as e:
+        log.debug(f"set_message_reaction failed: {e}")
 
 
 async def _cancel_active(chat_id: int):
@@ -164,9 +180,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    user_msg_id = update.message.message_id
 
     # Cancel any in-progress response for this chat (steering)
     await _cancel_active(chat_id)
+
+    # ACK: eyeballs on the user's message while we work on it.
+    await _set_reaction(ctx, chat_id, user_msg_id, ACK_RECEIVED)
 
     task = asyncio.create_task(_handle_message(update, ctx, chat_id, text))
     _active_tasks[chat_id] = task
@@ -187,6 +207,7 @@ async def _handle_message(
     cfg: Config = ctx.bot_data["config"]
     db: Database = ctx.bot_data["db"]
     claude: ClaudeClient = ctx.bot_data["claude"]
+    user_msg_id = update.message.message_id
 
     await ctx.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
 
@@ -245,18 +266,37 @@ async def _handle_message(
                 return
         # Show the last TG_MAX_LEN chars during streaming (tail the live message)
         display = accumulated[-TG_MAX_LEN:] if len(accumulated) > TG_MAX_LEN else accumulated
+        text = display or "…"
         try:
             await ctx.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=reply_id,
-                text=display or "…",
+                text=text,
                 parse_mode=constants.ParseMode.MARKDOWN,
             )
             last_edit_len = len(accumulated)
             last_edit_time = now
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
+        except BadRequest as e:
+            msg = str(e).lower()
+            if "message is not modified" in msg:
+                return
+            # Malformed markdown from the model (unclosed backticks, stray *,
+            # etc.) — retry as plain text rather than freezing the stream.
+            if "can't parse entities" in msg or "parse" in msg:
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=reply_id,
+                        text=text,
+                    )
+                    last_edit_len = len(accumulated)
+                    last_edit_time = now
+                except Exception as e2:
+                    log.debug(f"Plain-text retry also failed: {e2}")
+            else:
                 log.debug(f"Edit failed (will retry): {e}")
+        except Exception as e:
+            log.debug(f"Edit failed (will retry): {e}")
 
     thinking_task = asyncio.create_task(_animate_thinking())
 
@@ -289,11 +329,16 @@ async def _handle_message(
     try:
         async for chunk in _stream_with_session_recovery():
             if chunk.error:
+                # Stop the animator before displaying the error — otherwise its
+                # next tick overwrites our error message with a thinking frame.
+                first_chunk_received = True
+                thinking_task.cancel()
                 await ctx.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=reply_id,
                     text=f"Error: {chunk.error}",
                 )
+                await _set_reaction(ctx, chat_id, user_msg_id, None)
                 return
 
             if chunk.text:
@@ -309,7 +354,10 @@ async def _handle_message(
     except asyncio.CancelledError:
         first_chunk_received = True
         thinking_task.cancel()
-        # Steered away — mark the placeholder as interrupted and propagate
+        # Steered away — mark the placeholder as interrupted and propagate.
+        # Don't touch the reaction here: the next message's on_message handler
+        # will set a fresh 👀 on its own user_msg, and the old one staying as
+        # 👀 is a fair signal that *that* message was interrupted.
         stub = (accumulated[:200] + "…\n\n_[interrupted]_") if accumulated else "_[interrupted]_"
         try:
             await ctx.bot.edit_message_text(
@@ -331,6 +379,7 @@ async def _handle_message(
             message_id=reply_id,
             text=f"Unexpected error: {e}",
         )
+        await _set_reaction(ctx, chat_id, user_msg_id, None)
         return
 
     thinking_task.cancel()
@@ -371,16 +420,19 @@ async def _handle_message(
     if accumulated:
         db.log_exchange(chat_id, "assistant", accumulated, session["model"])
 
+    # Swap eyeballs → check mark so the user's message shows "done" at a glance.
+    await _set_reaction(ctx, chat_id, user_msg_id, ACK_DONE)
+
 
 # ── Startup ──────────────────────────────────────────────────────────────────
 
 def setup_logging(log_dir: str, log_level: str):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     level = getattr(logging, log_level.upper(), logging.INFO)
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(str(Path(log_dir) / "bridge.log")),
-    ]
+    # Only a FileHandler: launchd already redirects stdout to bridge.log via
+    # StandardOutPath, so adding a StreamHandler(stdout) would write every
+    # line twice.
+    handlers = [logging.FileHandler(str(Path(log_dir) / "bridge.log"))]
     # force=True removes any handlers already on the root logger (prevents
     # duplicate log lines when the process is restarted by launchd).
     logging.basicConfig(
@@ -390,7 +442,7 @@ def setup_logging(log_dir: str, log_level: str):
         force=True,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.DEBUG)
 
 
 def main():
@@ -419,6 +471,22 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    async def _post_init(app: Application) -> None:
+        # Register commands so they appear in Telegram's `/` picker.
+        # Runs once after the bot is authenticated; non-fatal on failure.
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("new", "Start a fresh conversation"),
+                BotCommand("model", "View or switch Claude model"),
+                BotCommand("status", "Show current session info"),
+                BotCommand("help", "Show available commands"),
+            ])
+            log.info("Registered bot commands with Telegram")
+        except Exception as e:
+            log.warning(f"set_my_commands failed (non-fatal): {e}")
+
+    app.post_init = _post_init
 
     async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Log errors; on RetryAfter sleep the required time instead of crashing."""

@@ -43,7 +43,7 @@ class Config:
 
     # Claude CLI
     default_model: str = "sonnet"
-    command_timeout_secs: int = 120
+    command_timeout_secs: int = 600
 
     # Trading system integration (optional — disable before open-source publish)
     trading_system_enabled: bool = False
@@ -70,7 +70,7 @@ def load_config() -> Config:
         sys.exit(1)
 
     default_model = _optional("DEFAULT_MODEL", "sonnet")
-    cmd_timeout = _optional_int("COMMAND_TIMEOUT_SECS", 120)
+    cmd_timeout = _optional_int("COMMAND_TIMEOUT_SECS", 600)
     data_dir = _optional("DATA_DIR", "./data")
     log_dir = _optional("LOG_DIR", "./logs")
     log_level = _optional("LOG_LEVEL", "INFO").upper()
