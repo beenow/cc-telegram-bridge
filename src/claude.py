@@ -9,24 +9,29 @@ No Anthropic API key needed — uses your existing Claude Code subscription.
 import asyncio
 import json
 import logging
-import shutil
+import os
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator
 
 log = logging.getLogger(__name__)
 
-# Resolve `claude` from PATH; fall back to common install locations.
-CLAUDE_BIN = (
-    shutil.which("claude")
-    or shutil.which("claude", path="/usr/local/bin:/opt/homebrew/bin")
-    or "claude"
-)
+# Pin to the user-local install. Different Claude installs have different auth
+# state and ACLs on macOS keychain; picking one via PATH fallback silently
+# routes to the wrong binary after a system-wide update.
+# Override with CLAUDE_BIN=/path/to/claude if you need a different install.
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
 MAX_TOOL_ROUNDS = 10  # safety cap (claude CLI handles tools internally, but just in case)
 
 # Tight deadline to receive the first byte from the subprocess.
 # Catches stale --resume sessions that hang while loading large history.
 FIRST_BYTE_TIMEOUT = 30  # seconds
+
+# Once streaming has started, how long to wait for the next line before
+# declaring the subprocess stalled. Long tool-use chains can have multi-minute
+# silent gaps between JSON lines, so this needs to be generous.
+INTER_LINE_TIMEOUT = 1800  # 30 minutes — agentic tool runs (backtests, bash scripts) can be silent this long
 
 
 @dataclass
@@ -106,15 +111,21 @@ class ClaudeClient:
                 if remaining <= 0:
                     raise asyncio.TimeoutError()
 
-                wait = FIRST_BYTE_TIMEOUT if not got_first_byte else min(remaining, 60)
+                if not got_first_byte:
+                    wait = FIRST_BYTE_TIMEOUT
+                else:
+                    # Cap per-readline wait at INTER_LINE_TIMEOUT, but never exceed
+                    # the remaining total deadline.
+                    wait = min(remaining, INTER_LINE_TIMEOUT)
 
                 try:
                     raw = await asyncio.wait_for(proc.stdout.readline(), timeout=wait)
                 except asyncio.TimeoutError:
                     if not got_first_byte:
                         raise asyncio.TimeoutError()  # re-raise as first-byte timeout
-                    # Mid-stream timeout — process is just slow, keep waiting up to deadline
-                    continue
+                    # Mid-stream stall — subprocess alive but silent beyond INTER_LINE_TIMEOUT
+                    log.warning("Claude subprocess stalled mid-stream (no output for %ds)", INTER_LINE_TIMEOUT)
+                    raise asyncio.TimeoutError()
 
                 if not raw:
                     break  # EOF
@@ -162,7 +173,7 @@ class ClaudeClient:
             if not got_first_byte:
                 yield StreamChunk(error=f"Claude did not respond within {FIRST_BYTE_TIMEOUT}s — session may be stale. Send /new to reset.")
             else:
-                yield StreamChunk(error=f"Claude timed out after {self._timeout}s")
+                yield StreamChunk(error=f"Claude stalled mid-response (no output for {INTER_LINE_TIMEOUT}s). The task may still be running — send /new if it doesn't recover.")
         except FileNotFoundError:
             yield StreamChunk(error=f"Claude CLI not found ({CLAUDE_BIN}). Is Claude Code installed and on PATH?")
         except Exception as e:
@@ -222,7 +233,11 @@ class ClaudeClient:
 
         elif event_type == "result":
             if data.get("is_error"):
-                return StreamChunk(error=data.get("result", "Unknown error from Claude CLI"))
+                # Newer CLI puts error text in errors[] array; older versions used `result`.
+                # Check both so session-recovery heuristics can match the message.
+                errors = data.get("errors") or []
+                msg = "; ".join(str(e) for e in errors) if errors else data.get("result") or ""
+                return StreamChunk(error=msg or "Unknown error from Claude CLI")
             return StreamChunk(done=True)
 
         elif event_type == "system":
