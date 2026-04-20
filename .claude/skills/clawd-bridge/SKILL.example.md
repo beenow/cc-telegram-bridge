@@ -58,10 +58,11 @@ Grep the last ~200 lines for each signature:
 | Signature in log | Root cause | Fix |
 | --- | --- | --- |
 | `claude exited 127: env: node: No such file or directory` | Daemon PATH is missing `/usr/local/bin` or `/opt/homebrew/bin`, so `claude`'s `#!/usr/bin/env node` shebang can't find node. | Ensure plist `EnvironmentVariables.PATH` includes `~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`. Reload. |
-| `telegram.error.Conflict: terminated by other getUpdates` | A second bot instance is polling the same token. | Find and kill it: `pgrep -fa 'src/bridge.py'`. Only one PID should match (the daemon). |
+| `telegram.error.Conflict: terminated by other getUpdates` | Another process is polling the same bot token. A common source is a separately-installed Telegram plugin / bot reusing the token. Verify with `ps auxww \| grep -i telegram` and `pgrep -fa 'src/bridge.py'`. | If the collider is an external tool you intentionally run with the same token, that's a known collision — log noise is expected; in-flight tasks are NOT affected by Conflict (the bridge only misses *new* inbound updates during the colliding poll window). If it's a stray bridge.py, kill the non-daemon PID. |
 | `telegram.error.RetryAfter: Flood control exceeded. Retry in <N> seconds` | Telegram rate-limited the bot token (often triggered by a crash loop). | Wait `<N>` seconds. Confirm `_error_handler` in `bridge.py` catches `RetryAfter` — if it's missing, the process will keep crashing and extending the ban. |
-| `Claude did not respond within 30s — session may be stale` | A per-chat Claude session is wedged on `--resume`. | The code auto-recovers on "no conversation found", but if the CLI hangs without erroring, user should `/new` in that chat. As operator, you can also clear the stuck row: `sqlite3 data/bridge.db "UPDATE sessions SET claude_session_id=NULL WHERE chat_id=<id>;"`. |
+| `Claude did not respond within 30s — session may be stale` | The CLI emitted no output within 30s of starting. Usually a wedged `--resume` loading a large/corrupt history, or a logged-out Claude CLI that never prompted. This is now the **only** timeout path that auto-kills the subprocess; all post-first-byte timeouts are non-fatal by design. | The code auto-recovers on "no conversation found". If the CLI hangs silently, user should `/new`. Operator can clear: `sqlite3 data/bridge.db "UPDATE sessions SET claude_session_id=NULL WHERE chat_id=<id>;"`. |
 | `Not logged in · Please run /login` in a CLI smoke test | The `claude` binary the daemon invokes is not the one your interactive shell logged into. Usually a dual-install issue: another `claude` exists (e.g. `/usr/local/bin/claude` from `sudo npm -g`) and your terminal resolves to that one. | Uninstall the stray binary (`sudo npm uninstall -g --prefix=/usr/local @anthropic-ai/claude-code`), or pin `CLAUDE_BIN` in the plist to the one you've authenticated. |
+| User reports "long task never finishes / I never got a heartbeat" | The heartbeat coroutine in `_handle_message` was cancelled or the whole handler died silently. The bridge has no auto-kill after first byte by design, so a truly wedged task will sit forever unless explicitly cancelled. | Ask user to run `/ping` — that reports liveness from `_chat_liveness` without touching the subprocess. If `/ping` says "No active task" but the CLI subprocess is still alive (`pgrep -fa claude.*--print`), the bridge lost the handle; operator should kill the orphaned CLI PID manually and have the user `/new`. |
 
 ### 4. Verify PATH inside the running process
 
@@ -152,6 +153,7 @@ Distilled from reviewing a clawdbot checkout. Each pattern is tagged **adopt / a
 
 **For clawd-bridge:**
 - **Done:** ACK reaction via `bot.set_message_reaction(chat_id, message_id, [ReactionTypeEmoji("👀")])` on receipt, swap to ✅ on success, clear on error. Bot API 7.0+.
+- **Done:** Long-task heartbeat. `_heartbeat()` in `bridge.py` sends a passive "⏳ Still working… (running Nm, last output Nm ago)" message every 5 min of CLI silence. Crucially this **sends a new message** instead of editing the streaming placeholder, so any accumulated output is preserved. Paired with a `/ping` command that reads `_chat_liveness[chat_id]` (started_at / last_chunk_at / bytes_streamed) and reports without disturbing the subprocess. Rationale: user is often away from desk; losing a task to a silent timeout = whole day lost. Reliability > auto-completion.
 - **Consider:** Replace the animated "N is thinking ." placeholder with a periodic `send_chat_action("typing")` refresh every ~4s (the action auto-expires at ~5s). Cheaper on Telegram's edit budget.
 - **Skip:** Scope policy — single-user bot, just ACK every time or not at all.
 
@@ -166,7 +168,8 @@ Distilled from reviewing a clawdbot checkout. Each pattern is tagged **adopt / a
 **For clawd-bridge:**
 - **Done:** Parse-mode fallback in `_edit()` — catches `BadRequest("can't parse entities")`, retries `parse_mode=None`.
 - **Done:** `RetryAfter` in `_error_handler` (see CLAUDE.md).
-- **Adapt:** Current error messages (`"Claude stalled..."`, `"Claude timed out..."`, `"No conversation found..."`) are specific and actionable with `/new`. Don't regress to generic "Error occurred" when catching exceptions.
+- **Done:** Removed the mid-stream kill timer and the total-deadline cap entirely. A previous bug had a 30-min `INTER_LINE_TIMEOUT` reported in error text but `COMMAND_TIMEOUT_SECS=600` as the actual killer — every long task died at exactly 600s with a misleading "1800s" message. Current design: the **only** auto-kill path is `FIRST_BYTE_TIMEOUT=30s` (catches wedged `--resume`). After first byte, silence is never fatal; `READLINE_POLL_SECS=300` just keeps the event loop responsive between readline polls. Never re-introduce a mid-stream timeout without the same heartbeat design — the user relies on tasks *always* finishing or being explicitly cancelled, not on heuristic timeouts.
+- **Adapt:** Remaining error messages (`"Claude did not respond within 30s..."`, `"No conversation found..."`) are specific and actionable with `/new`. Don't regress to generic "Error occurred" when catching exceptions.
 
 ## 4. Attachments & media
 

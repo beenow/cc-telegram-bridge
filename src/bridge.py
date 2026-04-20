@@ -41,6 +41,15 @@ log = logging.getLogger(__name__)
 # Per-chat active tasks — new message cancels the previous one (steering)
 _active_tasks: dict[int, asyncio.Task] = {}
 
+# Per-chat liveness snapshot for /ping and the heartbeat editor.
+# started_at: time.monotonic() when the Claude subprocess launched
+# last_chunk_at: time.monotonic() of the most recent stdout chunk
+# bytes_streamed: total length of text streamed so far (rough progress signal)
+_chat_liveness: dict[int, dict[str, float]] = {}
+
+# How long to wait between heartbeat edits when the CLI is silent.
+HEARTBEAT_INTERVAL_SECS = 300  # 5 minutes
+
 # ACK reactions: 👀 on receipt, ✅ on success. Silently no-op on failure
 # (Bot API 7.0+ required; older accounts or group-permission issues shouldn't
 # break the reply path).
@@ -161,6 +170,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "  /new — start a fresh conversation\n"
         "  /model [name] — switch Claude model\n"
+        "  /ping — check if a long task is still running\n"
         "  /status — show current session info\n"
         "  /help — show this message"
     )
@@ -179,6 +189,41 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     db.reset_session(chat_id)
     await update.message.reply_text("Conversation reset. Starting fresh.")
+
+
+def _fmt_duration(secs: float) -> str:
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m {secs % 60}s"
+    hours = secs // 3600
+    mins = (secs % 3600) // 60
+    return f"{hours}h {mins}m"
+
+
+async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Report liveness of the current Claude task without disturbing it."""
+    cfg: Config = ctx.bot_data["config"]
+    if not _is_allowed(update, cfg):
+        return
+    chat_id = update.effective_chat.id
+    live = _chat_liveness.get(chat_id)
+    task = _active_tasks.get(chat_id)
+    if not live or not task or task.done():
+        await update.message.reply_text("No active task. Send a message to start one.")
+        return
+    now = time.monotonic()
+    elapsed = _fmt_duration(now - live["started_at"])
+    silence = _fmt_duration(now - live["last_chunk_at"])
+    bytes_streamed = int(live.get("bytes_streamed", 0))
+    await update.message.reply_text(
+        f"⏳ Task still running\n"
+        f"Elapsed: {elapsed}\n"
+        f"Last output: {silence} ago\n"
+        f"Streamed: {bytes_streamed} chars\n\n"
+        f"Send any message to cancel + redirect, or /new to reset."
+    )
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -338,6 +383,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass  # steering — new message took over
     finally:
         _active_tasks.pop(chat_id, None)
+        _chat_liveness.pop(chat_id, None)
 
 
 async def _handle_message(
@@ -376,6 +422,13 @@ async def _handle_message(
     last_edit_len = 0
     last_edit_time = time.monotonic()
     first_chunk_received = False
+    task_started = time.monotonic()
+    last_chunk_time = task_started
+    _chat_liveness[chat_id] = {
+        "started_at": task_started,
+        "last_chunk_at": task_started,
+        "bytes_streamed": 0,
+    }
 
     # Animated thinking indicator — cycles until first real text arrives
     _THINKING_FRAMES = [f"3 is thinking {'.' * i}" for i in range(1, 51)]
@@ -397,6 +450,35 @@ async def _handle_message(
                 )
             except Exception:
                 pass
+
+    async def _heartbeat():
+        """
+        After first byte, send a passive status message every
+        HEARTBEAT_INTERVAL_SECS while the CLI is silent. Unlike the thinking
+        animation, this does not overwrite real output — it sends a NEW
+        message so the streaming placeholder keeps its accumulated text.
+        """
+        while True:
+            try:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECS)
+            except asyncio.CancelledError:
+                return
+            now = time.monotonic()
+            silence = now - last_chunk_time
+            if silence < HEARTBEAT_INTERVAL_SECS * 0.9:
+                continue  # recent output — no need to heartbeat
+            elapsed = _fmt_duration(now - task_started)
+            silence_s = _fmt_duration(silence)
+            try:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⏳ Still working... (running {elapsed}, last output {silence_s} ago)\n"
+                        f"Send /ping anytime to check, or any message to redirect."
+                    ),
+                )
+            except Exception as e:
+                log.debug(f"heartbeat send failed: {e}")
 
     async def _edit(force: bool = False):
         nonlocal last_edit_len, last_edit_time
@@ -441,6 +523,7 @@ async def _handle_message(
             log.debug(f"Edit failed (will retry): {e}")
 
     thinking_task = asyncio.create_task(_animate_thinking())
+    heartbeat_task = asyncio.create_task(_heartbeat())
 
     async def _stream_with_session_recovery():
         """
@@ -475,6 +558,7 @@ async def _handle_message(
                 # next tick overwrites our error message with a thinking frame.
                 first_chunk_received = True
                 thinking_task.cancel()
+                heartbeat_task.cancel()
                 await ctx.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=reply_id,
@@ -488,6 +572,11 @@ async def _handle_message(
                     first_chunk_received = True
                     thinking_task.cancel()
                 accumulated += chunk.text
+                last_chunk_time = time.monotonic()
+                live = _chat_liveness.get(chat_id)
+                if live is not None:
+                    live["last_chunk_at"] = last_chunk_time
+                    live["bytes_streamed"] = len(accumulated)
                 await _edit()
 
             if chunk.done:
@@ -496,6 +585,7 @@ async def _handle_message(
     except asyncio.CancelledError:
         first_chunk_received = True
         thinking_task.cancel()
+        heartbeat_task.cancel()
         # Steered away — mark the placeholder as interrupted and propagate.
         # Don't touch the reaction here: the next message's on_message handler
         # will set a fresh 👀 on its own user_msg, and the old one staying as
@@ -515,6 +605,7 @@ async def _handle_message(
     except Exception as e:
         first_chunk_received = True
         thinking_task.cancel()
+        heartbeat_task.cancel()
         log.exception("Streaming error")
         await ctx.bot.edit_message_text(
             chat_id=chat_id,
@@ -525,6 +616,7 @@ async def _handle_message(
         return
 
     thinking_task.cancel()
+    heartbeat_task.cancel()
 
     # Final send — split into chunks if response exceeds Telegram's 4096-char limit
     if accumulated:
@@ -611,6 +703,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CallbackQueryHandler(cb_model, pattern=r"^model:"))
     # Accept plain text and any captioned/non-captioned media. Commands are
@@ -633,6 +726,7 @@ def main():
             await app.bot.set_my_commands([
                 BotCommand("new", "Start a fresh conversation"),
                 BotCommand("model", "View or switch Claude model"),
+                BotCommand("ping", "Check if a long task is still running"),
                 BotCommand("status", "Show current session info"),
                 BotCommand("help", "Show available commands"),
             ])

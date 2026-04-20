@@ -28,10 +28,12 @@ MAX_TOOL_ROUNDS = 10  # safety cap (claude CLI handles tools internally, but jus
 # Catches stale --resume sessions that hang while loading large history.
 FIRST_BYTE_TIMEOUT = 30  # seconds
 
-# Once streaming has started, how long to wait for the next line before
-# declaring the subprocess stalled. Long tool-use chains can have multi-minute
-# silent gaps between JSON lines, so this needs to be generous.
-INTER_LINE_TIMEOUT = 1800  # 30 minutes — agentic tool runs (backtests, bash scripts) can be silent this long
+# Maximum time we're willing to block waiting for the NEXT stdout line once
+# streaming has started. This is NOT a task-kill timer — it's just how long
+# asyncio.wait_for will sleep between poll iterations so the event loop stays
+# responsive (cancellation, daemon shutdown, etc.). If the CLI is genuinely
+# silent for this long, we loop back and wait again — no kill.
+READLINE_POLL_SECS = 300  # 5 minutes
 
 
 @dataclass
@@ -45,6 +47,11 @@ class ClaudeClient:
     def __init__(self, system_prompt: str = "", model: str = "sonnet", timeout_secs: int = 120):
         self._system_prompt = system_prompt
         self._model = model
+        # timeout_secs is kept for API compatibility but intentionally NOT used
+        # as a total wall-clock deadline — long agentic runs emit output in
+        # bursts over hours, and a hard total cap would kill them mid-task.
+        # The stream liveness is governed by FIRST_BYTE_TIMEOUT and
+        # INTER_LINE_TIMEOUT instead.
         self._timeout = timeout_secs
         self._proc: asyncio.subprocess.Process | None = None
 
@@ -77,10 +84,15 @@ class ClaudeClient:
         Yields StreamChunk objects with incremental text.
 
         Timeouts:
-        - FIRST_BYTE_TIMEOUT (30s): if no output at all within 30s, the subprocess
-          is killed and an error is yielded. Catches stale --resume hangs where the
-          CLI is loading a large/corrupt history and never starts responding.
-        - self._timeout: total wall-clock cap for the entire response.
+        - FIRST_BYTE_TIMEOUT (30s): if no output at all within 30s, the
+          subprocess is killed. Catches stale --resume hangs where the CLI is
+          loading a large/corrupt history and never starts responding. This is
+          the ONLY path that kills the subprocess automatically.
+        - After the first byte, there is NO kill timer. A long agentic run can
+          stay silent for hours between stdout lines (long tool calls, sleeps,
+          waiting on external services) and the bridge will keep waiting. The
+          caller should use steering (send a new message) or /new to stop a
+          wedged task — we never time-bomb it here.
         """
         cmd = self._build_command(prompt, session_id, is_new_session)
         log.info(f"Running: {' '.join(cmd[:6])}...")
@@ -103,29 +115,30 @@ class ClaudeClient:
             proc = self._proc
 
             full_text = ""
-            deadline = asyncio.get_event_loop().time() + self._timeout
 
             while True:
-                # Choose timeout: tight first-byte window until we get output, then total deadline.
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError()
-
                 if not got_first_byte:
-                    wait = FIRST_BYTE_TIMEOUT
+                    # Kill-on-timeout only while waiting for the very first byte.
+                    try:
+                        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=FIRST_BYTE_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        raise
                 else:
-                    # Cap per-readline wait at INTER_LINE_TIMEOUT, but never exceed
-                    # the remaining total deadline.
-                    wait = min(remaining, INTER_LINE_TIMEOUT)
-
-                try:
-                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=wait)
-                except asyncio.TimeoutError:
-                    if not got_first_byte:
-                        raise asyncio.TimeoutError()  # re-raise as first-byte timeout
-                    # Mid-stream stall — subprocess alive but silent beyond INTER_LINE_TIMEOUT
-                    log.warning("Claude subprocess stalled mid-stream (no output for %ds)", INTER_LINE_TIMEOUT)
-                    raise asyncio.TimeoutError()
+                    # Poll in bounded chunks so the event loop stays responsive
+                    # to cancellation, but don't kill on silence — just keep
+                    # waiting for the next line however long that takes.
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(
+                                proc.stdout.readline(), timeout=READLINE_POLL_SECS
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            if proc.returncode is not None:
+                                raw = b""  # subprocess actually exited
+                                break
+                            # Still alive, just quiet. Loop and wait again.
+                            continue
 
                 if not raw:
                     break  # EOF
@@ -169,11 +182,10 @@ class ClaudeClient:
             self.cancel()
             raise
         except asyncio.TimeoutError:
+            # Only path that reaches here is the first-byte timeout; any
+            # post-first-byte timeout is absorbed into the inner poll loop.
             self.cancel()
-            if not got_first_byte:
-                yield StreamChunk(error=f"Claude did not respond within {FIRST_BYTE_TIMEOUT}s — session may be stale. Send /new to reset.")
-            else:
-                yield StreamChunk(error=f"Claude stalled mid-response (no output for {INTER_LINE_TIMEOUT}s). The task may still be running — send /new if it doesn't recover.")
+            yield StreamChunk(error=f"Claude did not respond within {FIRST_BYTE_TIMEOUT}s — session may be stale. Send /new to reset.")
         except FileNotFoundError:
             yield StreamChunk(error=f"Claude CLI not found ({CLAUDE_BIN}). Is Claude Code installed and on PATH?")
         except Exception as e:

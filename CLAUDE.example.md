@@ -6,8 +6,8 @@ Telegram bot that fronts the local Claude Code CLI. Each Telegram chat maps to a
 
 ## Architecture
 
-- `src/bridge.py` — Telegram polling entrypoint. Handlers for `/start`, `/new`, `/model`, `/status`, plus a text handler that streams a reply. Per-chat active task is stored in `_active_tasks`; a new message cancels the previous one (steering).
-- `src/claude.py` — Wraps the `claude` CLI as an async subprocess. `stream()` yields `StreamChunk(text|done|error)` parsed from `--output-format stream-json --verbose`. Enforces a 30s first-byte timeout and a total `COMMAND_TIMEOUT_SECS` deadline.
+- `src/bridge.py` — Telegram polling entrypoint. Handlers for `/start`, `/new`, `/model`, `/status`, `/ping`, `/help`, plus a text/media handler that streams a reply. Per-chat active task is stored in `_active_tasks`; a new message cancels the previous one (steering). Per-chat liveness (started_at / last_chunk_at / bytes_streamed) in `_chat_liveness` drives `/ping` and the 5-min heartbeat.
+- `src/claude.py` — Wraps the `claude` CLI as an async subprocess. `stream()` yields `StreamChunk(text|done|error)` parsed from `--output-format stream-json --verbose`. Enforces a 30s first-byte timeout only; post-first-byte silence is never fatal (see Telegram quirks). `READLINE_POLL_SECS=300` is a responsiveness poll, not a kill timer.
 - `src/db.py` — SQLite at `data/bridge.db`. One row per chat with the Claude session UUID and model. `exchanges` table is an append-only audit log.
 - `src/config.py` — Reads `.env`. `soul.md` (if present) is prepended to the system prompt.
 
@@ -35,6 +35,7 @@ tail -f logs/bridge.log
 - **Steering**: sending a new message during streaming cancels the prior subprocess and the placeholder is marked `[interrupted]`.
 - **Attachments**: Claude CLI can't take file paths in `--print` mode, so inbound media (photo/document/video/audio/voice/video_note) is downloaded to `downloads/` with filename pattern `{chat_id}_{ts}_{msg_id}_{sanitized_name}`, and the prompt is prefixed with an `[Attachments available on disk — use your Read/file tools...]` block listing the paths. Claude can then open them via its own file tools.
 - **Inline `/model`**: `/model` with no argument shows a one-tap inline keyboard. Callback data is `model:<name>` (≤64 chars). Handled by `cb_model` dispatched on the `^model:` regex.
+- **No mid-stream timeout**: after the 30s first-byte check, the bridge never auto-kills a running CLI. A previous design killed at `COMMAND_TIMEOUT_SECS=600` with a misleading "1800s" error message, losing long agentic tasks whenever the user was away from their desk. Replaced with a 5-min heartbeat (`_heartbeat()` in bridge.py) that sends a passive "⏳ Still working..." message rather than touching the streaming placeholder. `/ping` reports liveness from `_chat_liveness[chat_id]` without disturbing the subprocess. Cancellation is explicit only (steering / `/new`). Do NOT re-introduce a mid-stream kill timer.
 
 ## Session lifecycle
 
@@ -53,6 +54,7 @@ tail -f logs/bridge.log
 
 - `asyncio` `StreamReader` limit is bumped to 10 MB (`_STREAM_LIMIT` in `claude.py`) — default 64 KB crashed on large tool outputs with `LimitOverrunError`.
 - `FIRST_BYTE_TIMEOUT = 30s` catches stale `--resume` sessions that hang loading large/corrupt history; the user sees an actionable "send /new" hint.
+- After first byte there is **no kill timer**. `READLINE_POLL_SECS=300` is a bounded `asyncio.wait_for` wait that loops on timeout (checking `proc.returncode`) — it exists purely to keep the event loop responsive to cancellation, not to kill the subprocess.
 - `basicConfig(force=True)` clears root handlers on startup so launchd restarts don't accumulate duplicates inside the Python process.
 
 ## Diagnostic checklist when "bot isn't responding"
@@ -69,3 +71,4 @@ tail -f logs/bridge.log
 - Don't drop the plist `PATH` env var — bot goes silent within one message.
 - Don't remove `drop_pending_updates=True` from `run_polling` — after a flood ban or long restart, queued updates can flood the handler.
 - Don't skip the `RetryAfter` branch in `_error_handler` — re-raising crashes the process under `KeepAlive` and re-triggers the ban.
+- Don't re-introduce a mid-stream timeout in `claude.py` — long agentic tasks legitimately go silent between tool calls. The heartbeat + `/ping` pair replaces the timeout entirely; losing a half-day's work to a heuristic kill is worse than an occasional genuinely-wedged CLI (which the user can cancel via `/new`).
