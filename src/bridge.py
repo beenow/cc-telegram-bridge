@@ -422,6 +422,7 @@ async def _handle_message(
     last_edit_len = 0
     last_edit_time = time.monotonic()
     first_chunk_received = False
+    task_complete = False
     task_started = time.monotonic()
     last_chunk_time = task_started
     _chat_liveness[chat_id] = {
@@ -457,28 +458,39 @@ async def _handle_message(
         HEARTBEAT_INTERVAL_SECS while the CLI is silent. Unlike the thinking
         animation, this does not overwrite real output — it sends a NEW
         message so the streaming placeholder keeps its accumulated text.
+
+        Sleep is broken into 1s ticks so cancellation + task completion are
+        observed promptly: a heartbeat that wakes up to find the task already
+        finished must NOT send a stale "Still working..." message.
         """
-        while True:
-            try:
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SECS)
-            except asyncio.CancelledError:
-                return
-            now = time.monotonic()
-            silence = now - last_chunk_time
-            if silence < HEARTBEAT_INTERVAL_SECS * 0.9:
-                continue  # recent output — no need to heartbeat
-            elapsed = _fmt_duration(now - task_started)
-            silence_s = _fmt_duration(silence)
-            try:
-                await ctx.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"⏳ Still working... (running {elapsed}, last output {silence_s} ago)\n"
-                        f"Send /ping anytime to check, or any message to redirect."
-                    ),
-                )
-            except Exception as e:
-                log.debug(f"heartbeat send failed: {e}")
+        try:
+            while True:
+                slept = 0.0
+                while slept < HEARTBEAT_INTERVAL_SECS:
+                    await asyncio.sleep(1)
+                    if task_complete:
+                        return
+                    slept += 1
+                if task_complete:
+                    return
+                now = time.monotonic()
+                silence = now - last_chunk_time
+                if silence < HEARTBEAT_INTERVAL_SECS * 0.9:
+                    continue  # recent output — no need to heartbeat
+                elapsed = _fmt_duration(now - task_started)
+                silence_s = _fmt_duration(silence)
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"⏳ Still working... (running {elapsed}, last output {silence_s} ago)\n"
+                            f"Send /ping anytime to check, or any message to redirect."
+                        ),
+                    )
+                except Exception as e:
+                    log.debug(f"heartbeat send failed: {e}")
+        except asyncio.CancelledError:
+            return
 
     async def _edit(force: bool = False):
         nonlocal last_edit_len, last_edit_time
@@ -557,6 +569,7 @@ async def _handle_message(
                 # Stop the animator before displaying the error — otherwise its
                 # next tick overwrites our error message with a thinking frame.
                 first_chunk_received = True
+                task_complete = True
                 thinking_task.cancel()
                 heartbeat_task.cancel()
                 await ctx.bot.edit_message_text(
@@ -584,6 +597,7 @@ async def _handle_message(
 
     except asyncio.CancelledError:
         first_chunk_received = True
+        task_complete = True
         thinking_task.cancel()
         heartbeat_task.cancel()
         # Steered away — mark the placeholder as interrupted and propagate.
@@ -604,6 +618,7 @@ async def _handle_message(
 
     except Exception as e:
         first_chunk_received = True
+        task_complete = True
         thinking_task.cancel()
         heartbeat_task.cancel()
         log.exception("Streaming error")
@@ -615,6 +630,7 @@ async def _handle_message(
         await _set_reaction(ctx, chat_id, user_msg_id, None)
         return
 
+    task_complete = True
     thinking_task.cancel()
     heartbeat_task.cancel()
 

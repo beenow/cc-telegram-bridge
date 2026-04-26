@@ -46,7 +46,7 @@ tail -f logs/bridge.log
 
 ## Config
 
-`.env` required: `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS` (comma-separated ints — any junk triggers a hard exit). Optional: `DEFAULT_MODEL` (default `sonnet`), `COMMAND_TIMEOUT_SECS` (default 600), `DATA_DIR`, `LOG_DIR`, `DOWNLOADS_DIR` (default `./downloads`, gitignored), `LOG_LEVEL`, `TRADING_SYSTEM_ENABLED` + `TRADING_SYSTEM_LOG_DIR` + `TRADING_SYSTEM_CONFIG_PATH`.
+`.env` required: `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS` (comma-separated ints — any junk triggers a hard exit). Optional: `DEFAULT_MODEL` (default `sonnet`), `COMMAND_TIMEOUT_SECS` (default 600), `DATA_DIR`, `LOG_DIR`, `DOWNLOADS_DIR` (default `./downloads`, gitignored), `LOG_LEVEL`.
 
 `soul.md` (gitignored) is prepended to the system prompt. `soul.example.md` is the published template.
 
