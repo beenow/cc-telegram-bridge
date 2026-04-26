@@ -38,14 +38,33 @@ from claude import ClaudeClient, StreamChunk
 
 log = logging.getLogger(__name__)
 
-# Per-chat active tasks — new message cancels the previous one (steering)
+# Per-chat active tasks. New messages while a task is running are queued
+# (not steered) — see `_pending`. Use /stop to cancel.
 _active_tasks: dict[int, asyncio.Task] = {}
+
+# Per-chat one-slot queue. If a message arrives while a task is running, it's
+# parked here; a later message replaces (not stacks). Drained when the active
+# task finishes.
+_pending: dict[int, dict] = {}
+
+# Serializes the (check active → either run or queue) decision per chat so a
+# message arriving exactly at task-completion can't both queue *and* be left
+# behind by the drainer.
+_chat_locks: dict[int, asyncio.Lock] = {}
 
 # Per-chat liveness snapshot for /ping and the heartbeat editor.
 # started_at: time.monotonic() when the Claude subprocess launched
 # last_chunk_at: time.monotonic() of the most recent stdout chunk
 # bytes_streamed: total length of text streamed so far (rough progress signal)
 _chat_liveness: dict[int, dict[str, float]] = {}
+
+
+def _lock_for(chat_id: int) -> asyncio.Lock:
+    lock = _chat_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_locks[chat_id] = lock
+    return lock
 
 # How long to wait between heartbeat edits when the CLI is silent.
 HEARTBEAT_INTERVAL_SECS = 300  # 5 minutes
@@ -171,8 +190,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  /new — start a fresh conversation\n"
         "  /model [name] — switch Claude model\n"
         "  /ping — check if a long task is still running\n"
+        "  /stop — cancel the current task (and drop any queued message)\n"
         "  /status — show current session info\n"
-        "  /help — show this message"
+        "  /help — show this message\n\n"
+        "Long task etiquette: if you send a message while a task is running, "
+        "it's queued (one slot — newer messages replace the queued one). "
+        "Use /stop to cancel; use /new to reset the conversation."
     )
     await update.message.reply_text(text)
 
@@ -187,8 +210,34 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update, cfg):
         return
     chat_id = update.effective_chat.id
+    # Cancel anything in flight and drop any queued message before resetting,
+    # so the session reset isn't shadowed by a still-running task.
+    await _cancel_active(chat_id)
+    _pending.pop(chat_id, None)
     db.reset_session(chat_id)
     await update.message.reply_text("Conversation reset. Starting fresh.")
+
+
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Cancel the active task and drop any queued message."""
+    cfg: Config = ctx.bot_data["config"]
+    if not _is_allowed(update, cfg):
+        return
+    chat_id = update.effective_chat.id
+    active = _active_tasks.get(chat_id)
+    pending = _pending.pop(chat_id, None)
+    had_active = bool(active and not active.done())
+    if had_active:
+        await _cancel_active(chat_id)
+    if not had_active and not pending:
+        await update.message.reply_text("Nothing running.")
+        return
+    parts = []
+    if had_active:
+        parts.append("🛑 Stopped current task.")
+    if pending:
+        parts.append("Dropped queued message.")
+    await update.message.reply_text(" ".join(parts))
 
 
 def _fmt_duration(secs: float) -> str:
@@ -217,12 +266,17 @@ async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elapsed = _fmt_duration(now - live["started_at"])
     silence = _fmt_duration(now - live["last_chunk_at"])
     bytes_streamed = int(live.get("bytes_streamed", 0))
+    queued = _pending.get(chat_id)
+    queued_line = ""
+    if queued:
+        waited = _fmt_duration(now - queued["queued_at"])
+        queued_line = f"\nQueued: 1 message (waiting {waited})"
     await update.message.reply_text(
         f"⏳ Task still running\n"
         f"Elapsed: {elapsed}\n"
         f"Last output: {silence} ago\n"
-        f"Streamed: {bytes_streamed} chars\n\n"
-        f"Send any message to cancel + redirect, or /new to reset."
+        f"Streamed: {bytes_streamed} chars{queued_line}\n\n"
+        f"Send /stop to cancel, or any message to queue for next."
     )
 
 
@@ -361,12 +415,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_msg_id = msg.message_id
 
-    # Cancel any in-progress response for this chat (steering)
-    await _cancel_active(chat_id)
-
-    # ACK: eyeballs on the user's message while we work on it.
-    await _set_reaction(ctx, chat_id, user_msg_id, ACK_RECEIVED)
-
     # Download any attachments; inject their paths into the prompt so the
     # Claude CLI (which can't take attachments in --print mode) can Read them.
     attachments = await _download_attachments(update, ctx, Path(cfg.downloads_dir))
@@ -375,14 +423,89 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     prompt = _build_prompt_with_attachments(text, attachments)
 
-    task = asyncio.create_task(_handle_message(update, ctx, chat_id, prompt))
-    _active_tasks[chat_id] = task
+    # ACK: eyeballs on the user's message — set this regardless of whether
+    # we run now or queue, so the user sees their message was received.
+    await _set_reaction(ctx, chat_id, user_msg_id, ACK_RECEIVED)
+
+    # Decide queue-or-run under the per-chat lock so a message arriving exactly
+    # at task-completion either sees `active` and queues, or sees `active` gone
+    # and runs — never both, never neither.
+    async with _lock_for(chat_id):
+        active = _active_tasks.get(chat_id)
+        if active and not active.done():
+            # Busy — queue (one slot, replace any prior queued message).
+            prev = _pending.get(chat_id)
+            _pending[chat_id] = {
+                "update": update,
+                "prompt": prompt,
+                "user_msg_id": user_msg_id,
+                "queued_at": time.monotonic(),
+            }
+            ack = (
+                "✏️ Replaced queued message — will run this one when current task finishes.\n"
+                "Send /stop to cancel the current task, or /ping to check progress."
+                if prev else
+                "📥 Queued — current task is still running. I'll get to this when it's done.\n"
+                "Send /stop to cancel the current task, or /ping to check progress."
+            )
+            try:
+                await ctx.bot.send_message(chat_id=chat_id, text=ack)
+            except Exception as e:
+                log.debug(f"queue ack send failed: {e}")
+            return
+
+        # Idle — start now. Spawn a background task that runs the request and
+        # then drains any queued message. Don't await it here, so this handler
+        # returns quickly and the next incoming update can dispatch.
+        runner = asyncio.create_task(_run_and_drain(update, ctx, chat_id, prompt))
+        _active_tasks[chat_id] = runner
+
+
+async def _run_and_drain(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    prompt: str,
+):
+    """
+    Run one `_handle_message` to completion, then loop and drain any message
+    that was queued in `_pending[chat_id]` while it was running. The lock is
+    re-acquired between iterations so a message arriving exactly at handoff
+    can't be lost: it'll either queue (next iteration picks it up) or land
+    after the slot is cleared (its own on_message starts fresh).
+    """
+    current_update = update
+    current_prompt = prompt
     try:
-        await task
-    except asyncio.CancelledError:
-        pass  # steering — new message took over
+        while True:
+            try:
+                await _handle_message(current_update, ctx, chat_id, current_prompt)
+            except asyncio.CancelledError:
+                # /stop or /new cancelled us — abandon the queue too.
+                _pending.pop(chat_id, None)
+                raise
+            except Exception:
+                log.exception("Unexpected error in _run_and_drain")
+                # Don't let one failure block the queued message — fall through
+                # to drain so the user still gets a reply for what they typed.
+
+            async with _lock_for(chat_id):
+                pending = _pending.pop(chat_id, None)
+                if not pending:
+                    # Clear the active slot under the lock so a concurrent
+                    # on_message either sees us active (queues) or sees the
+                    # slot empty (runs fresh). One or the other, never both.
+                    _active_tasks.pop(chat_id, None)
+                    _chat_liveness.pop(chat_id, None)
+                    return
+            current_update = pending["update"]
+            current_prompt = pending["prompt"]
+            _chat_liveness.pop(chat_id, None)  # reset liveness for the next run
     finally:
-        _active_tasks.pop(chat_id, None)
+        # Defensive cleanup: if we exited via exception or cancellation, make
+        # sure liveness state doesn't linger for a chat that has no task.
+        if _active_tasks.get(chat_id) is asyncio.current_task():
+            _active_tasks.pop(chat_id, None)
         _chat_liveness.pop(chat_id, None)
 
 
@@ -484,7 +607,7 @@ async def _handle_message(
                         chat_id=chat_id,
                         text=(
                             f"⏳ Still working... (running {elapsed}, last output {silence_s} ago)\n"
-                            f"Send /ping anytime to check, or any message to redirect."
+                            f"Send /ping to check, /stop to cancel, or any message to queue for next."
                         ),
                     )
                 except Exception as e:
@@ -710,7 +833,16 @@ def main():
         timeout_secs=cfg.command_timeout_secs,
     )
 
-    app = Application.builder().token(cfg.telegram_bot_token).build()
+    # concurrent_updates=True so a new message can dispatch while a prior
+    # task is still streaming for the same chat. Required for the queue UX:
+    # without this, PTB serializes per-chat updates and a queued message
+    # never even reaches on_message until the running task finishes.
+    app = (
+        Application.builder()
+        .token(cfg.telegram_bot_token)
+        .concurrent_updates(True)
+        .build()
+    )
     app.bot_data["config"] = cfg
     app.bot_data["db"] = db
     app.bot_data["claude"] = claude
@@ -718,6 +850,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("model", cmd_model))
@@ -743,6 +876,7 @@ def main():
                 BotCommand("new", "Start a fresh conversation"),
                 BotCommand("model", "View or switch Claude model"),
                 BotCommand("ping", "Check if a long task is still running"),
+                BotCommand("stop", "Cancel the current task"),
                 BotCommand("status", "Show current session info"),
                 BotCommand("help", "Show available commands"),
             ])

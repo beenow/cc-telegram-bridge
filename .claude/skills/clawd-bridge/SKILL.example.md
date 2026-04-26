@@ -63,6 +63,7 @@ Grep the last ~200 lines for each signature:
 | `Claude did not respond within 30s — session may be stale` | The CLI emitted no output within 30s of starting. Usually a wedged `--resume` loading a large/corrupt history, or a logged-out Claude CLI that never prompted. This is now the **only** timeout path that auto-kills the subprocess; all post-first-byte timeouts are non-fatal by design. | The code auto-recovers on "no conversation found". If the CLI hangs silently, user should `/new`. Operator can clear: `sqlite3 data/bridge.db "UPDATE sessions SET claude_session_id=NULL WHERE chat_id=<id>;"`. |
 | `Not logged in · Please run /login` in a CLI smoke test | The `claude` binary the daemon invokes is not the one your interactive shell logged into. Usually a dual-install issue: another `claude` exists (e.g. `/usr/local/bin/claude` from `sudo npm -g`) and your terminal resolves to that one. | Uninstall the stray binary (`sudo npm uninstall -g --prefix=/usr/local @anthropic-ai/claude-code`), or pin `CLAUDE_BIN` in the plist to the one you've authenticated. |
 | User reports "long task never finishes / I never got a heartbeat" | The heartbeat coroutine in `_handle_message` was cancelled or the whole handler died silently. The bridge has no auto-kill after first byte by design, so a truly wedged task will sit forever unless explicitly cancelled. | Ask user to run `/ping` — that reports liveness from `_chat_liveness` without touching the subprocess. If `/ping` says "No active task" but the CLI subprocess is still alive (`pgrep -fa claude.*--print`), the bridge lost the handle; operator should kill the orphaned CLI PID manually and have the user `/new`. |
+| User reports "I sent a message but bot is silent / I got a 'Queued' ack and forgot about it" | A prior task is still running for the chat. New messages are queued (one slot per chat, newer replaces) — they don't dispatch until the active task finishes. This is the intended UX as of 2026-04-25. | Ask user to `/ping` — it reports the active task's elapsed/silence and notes whether a queued message is waiting. To run the queued message immediately, `/stop` cancels the active task; to drop everything and reset, `/new`. |
 
 ### 4. Verify PATH inside the running process
 
@@ -131,7 +132,7 @@ Distilled from reviewing a clawdbot checkout. Each pattern is tagged **adopt / a
 
 - **clawd-bridge uses python-telegram-bot against the standard Bot API.** Several clawdbot patterns rely on grammy + a custom userbot/MTProto API (notably `sendMessageDraft`). Those won't work here. Always verify an API call exists in python-telegram-bot before porting.
 - **Single-user, single file (`bridge.py`).** Multi-tenant patterns (pairing, allowlists, per-group policy) are over-engineered for our scope.
-- **The existing design is good.** Edit-in-place streaming, steering cancel, per-chat Claude session, `/new` to reset — clawdbot validates these choices; don't churn them.
+- **The existing design is good.** Edit-in-place streaming, queue-on-busy with `/stop` as explicit cancel, per-chat Claude session, `/new` to reset — clawdbot validates most of these; don't churn them. (Note: 2026-04-25 we replaced the old "new message cancels current task" steering with a queue, since the user is often away from desk and an accidental follow-up would kill a multi-hour task.)
 
 ## 1. Streaming cadence
 
@@ -154,6 +155,7 @@ Distilled from reviewing a clawdbot checkout. Each pattern is tagged **adopt / a
 **For clawd-bridge:**
 - **Done:** ACK reaction via `bot.set_message_reaction(chat_id, message_id, [ReactionTypeEmoji("👀")])` on receipt, swap to ✅ on success, clear on error. Bot API 7.0+.
 - **Done:** Long-task heartbeat. `_heartbeat()` in `bridge.py` sends a passive "⏳ Still working… (running Nm, last output Nm ago)" message every 5 min of CLI silence. Crucially this **sends a new message** instead of editing the streaming placeholder, so any accumulated output is preserved. Paired with a `/ping` command that reads `_chat_liveness[chat_id]` (started_at / last_chunk_at / bytes_streamed) and reports without disturbing the subprocess. Rationale: user is often away from desk; losing a task to a silent timeout = whole day lost. Reliability > auto-completion.
+- **Done (2026-04-25):** Queue-by-default for incoming messages while a task is running. `_pending[chat_id]` holds at most one queued message (newer replaces) and is drained by `_run_and_drain` after the active task finishes. `/stop` is the explicit cancel; `/new` cancels + drops queue + resets the session. The Application is built with `concurrent_updates=True` so the queued message's `on_message` actually runs while the prior task is still streaming — without it, PTB serializes per-chat updates and the queue ack never gets sent. Replaces the prior "new message cancels current task" steering, which lost in-progress work whenever the user typed a follow-up while away.
 - **Consider:** Replace the animated "N is thinking ." placeholder with a periodic `send_chat_action("typing")` refresh every ~4s (the action auto-expires at ~5s). Cheaper on Telegram's edit budget.
 - **Skip:** Scope policy — single-user bot, just ACK every time or not at all.
 
@@ -204,7 +206,7 @@ Distilled from reviewing a clawdbot checkout. Each pattern is tagged **adopt / a
 - Inbound message debouncing: combines rapid-fire messages into one turn (`src/telegram/bot-handlers.ts:61-105`).
 
 **For clawd-bridge:**
-- **Adapt (optional):** Debouncing rapid messages is interesting — if user sends "one thing" + "also this" within ~2s, merge into one Claude turn rather than cancelling the first via steering. But steering is already a good default; debouncing is mutually exclusive. Not recommended unless user asks.
+- **Adapt (optional):** Debouncing rapid messages — if the user sends "one thing" + "also this" within ~2s, merge into a single Claude turn rather than queueing as two. The current queue keeps only the *latest* message anyway (newer replaces queued), so two rapid follow-ups already collapse cleanly without a real debounce — pure debounce would only help when the chat is *idle* and the user is mid-thought.
 - **Skip:** Forum topics, per-topic history — single-user DM doesn't use topics.
 - **Already done:** Per-chat Claude session UUID in `data/bridge.db`.
 

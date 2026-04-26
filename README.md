@@ -125,11 +125,14 @@ launchctl load ~/Library/LaunchAgents/com.clawd.bridge.plist
 
 ---
 
-## Message Steering
+## Long Tasks & Message Queue
 
-If Claude is mid-response and you send a new message, the current response is **immediately cancelled** and the new message starts processing. The interrupted message is marked `[interrupted]` in the chat.
+If Claude is mid-response and you send another message, the current task **keeps running** and the new message is **queued** (one slot per chat — newer messages replace any earlier queued one). The bridge acks the queued message and runs it as soon as the active task finishes. This is intentional: long agentic tasks can run for hours, and a stray follow-up shouldn't kill them.
 
-This means no queue buildup — your latest message always wins.
+- `/ping` reports whether a task is still running, how long it's been silent, and whether a message is queued — without disturbing the subprocess.
+- `/stop` cancels the active task (and drops anything queued).
+- `/new` resets the conversation entirely (cancels + drops queue + clears the Claude session).
+- The bot also sends a passive `⏳ Still working...` message every 5 minutes of CLI silence so you know it's alive.
 
 ---
 
@@ -138,9 +141,11 @@ This means no queue buildup — your latest message always wins.
 | Command | Description |
 |---|---|
 | `/start` | Introduction and help |
-| `/new` | Start a fresh conversation (clears session) |
+| `/new` | Start a fresh conversation (cancels any active task, drops queue, clears session) |
 | `/model` | Show one-tap inline keyboard to switch model |
 | `/model <name>` | Switch model directly — `sonnet`, `opus`, or `haiku` |
+| `/ping` | Check if a long task is still running and whether a message is queued |
+| `/stop` | Cancel the current task (and drop any queued message) |
 | `/status` | Show current session info (model, message count, session ID) |
 | `/help` | Show all commands |
 
@@ -273,9 +278,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 - [x] Image understanding (send photo → Claude reads it from disk)
 - [x] Document attachments (PDF / text / audio / video via Claude's file tools)
 - [x] One-tap `/model` picker
+- [x] `/stop` to cancel the current task without sending a new prompt
+- [x] Queue-by-default for messages sent during a long task (one-slot, newer replaces)
 - [ ] Voice message transcription (right now voice notes are passed through as `.ogg` files — Claude can inspect but not natively transcribe without a tool)
 - [ ] Scheduled messages / reminders via Telegram
-- [ ] `/stop` command to cancel the current response without sending a new one
 - [ ] Docker support
 
 ---
