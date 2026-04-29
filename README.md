@@ -225,6 +225,21 @@ launchctl unload ~/Library/LaunchAgents/com.clawd.bridge.plist
 bash scripts/uninstall-daemon.sh
 ```
 
+### What the installer does
+
+`scripts/install-daemon.sh` is a one-shot bootstrap. It:
+
+1. **Validates `.env`** — aborts if missing, since the bridge needs `TELEGRAM_BOT_TOKEN` to start.
+2. **Generates `~/Library/LaunchAgents/com.clawd.bridge.plist`** pointing launchd at `src/bridge.py` with the project root as `WorkingDirectory`. The plist is regenerated every run, so re-running the script picks up any change in Python path or project location.
+3. **Sets a usable `PATH`** in the plist: `~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`. launchd's default `PATH` is minimal and excludes Homebrew, so without this the `claude` CLI (a `#!/usr/bin/env node` shebang) fails silently with `exit 127 — env: node: No such file`.
+4. **Pipes stdout/stderr** to `logs/bridge.log` and `logs/bridge.err`.
+5. **Sets `RunAtLoad=true`, `KeepAlive=true`, `ThrottleInterval=10`** — the daemon starts at login, restarts on crash, but no faster than once every 10 seconds (so a tight crash loop can't melt the CPU).
+6. **Reloads launchd** — unloads any existing instance, then `launchctl load`s the new plist so the daemon is active immediately.
+
+The daemon runs as **your user**, not root. All paths and environment are inherited from the user that ran the installer.
+
+If you need to customise (e.g. point at a non-system Python), set `PYTHON=/path/to/python3 bash scripts/install-daemon.sh`.
+
 ---
 
 ## Data & Privacy
