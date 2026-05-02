@@ -58,6 +58,15 @@ _chat_locks: dict[int, asyncio.Lock] = {}
 # bytes_streamed: total length of text streamed so far (rough progress signal)
 _chat_liveness: dict[int, dict[str, float]] = {}
 
+# Telegram splits a multi-photo/document send into N separate Message updates
+# that share a `media_group_id`. We debounce them here: each arrival appends to
+# the buffer and (re)arms a flush timer; once MEDIA_GROUP_DEBOUNCE_SECS pass
+# with no new arrivals, the whole group is dispatched as a single prompt with
+# all attachment paths listed. Keyed by media_group_id (which is globally
+# unique per album).
+_media_groups: dict[str, dict] = {}
+MEDIA_GROUP_DEBOUNCE_SECS = 1.0
+
 
 def _lock_for(chat_id: int) -> asyncio.Lock:
     lock = _chat_locks.get(chat_id)
@@ -399,41 +408,24 @@ def _split_text(text: str, limit: int = TG_MAX_LEN) -> list[str]:
     return chunks
 
 
-async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cfg: Config = ctx.bot_data["config"]
-    if not _is_allowed(update, cfg):
-        log.warning(f"Rejected message from user {update.effective_user.id}")
-        return
-
-    msg = update.message
-    if msg is None:
-        return
-
-    # Text body is either .text (pure text) or .caption (media with caption).
-    text = (msg.text or msg.caption or "").strip()
-
-    chat_id = update.effective_chat.id
-    user_msg_id = msg.message_id
-
-    # Download any attachments; inject their paths into the prompt so the
-    # Claude CLI (which can't take attachments in --print mode) can Read them.
-    attachments = await _download_attachments(update, ctx, Path(cfg.downloads_dir))
-    if not text and not attachments:
-        return  # nothing to send
-
-    prompt = _build_prompt_with_attachments(text, attachments)
-
-    # ACK: eyeballs on the user's message — set this regardless of whether
-    # we run now or queue, so the user sees their message was received.
+async def _dispatch_prompt(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_msg_id: int,
+    prompt: str,
+):
+    """
+    Queue-or-run a fully-built prompt. The per-chat lock makes the decision
+    atomic against task completion: a message arriving exactly at handoff
+    either sees `active` and queues, or sees the slot empty and runs — never
+    both, never neither.
+    """
     await _set_reaction(ctx, chat_id, user_msg_id, ACK_RECEIVED)
 
-    # Decide queue-or-run under the per-chat lock so a message arriving exactly
-    # at task-completion either sees `active` and queues, or sees `active` gone
-    # and runs — never both, never neither.
     async with _lock_for(chat_id):
         active = _active_tasks.get(chat_id)
         if active and not active.done():
-            # Busy — queue (one slot, replace any prior queued message).
             prev = _pending.get(chat_id)
             _pending[chat_id] = {
                 "update": update,
@@ -454,11 +446,84 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.debug(f"queue ack send failed: {e}")
             return
 
-        # Idle — start now. Spawn a background task that runs the request and
-        # then drains any queued message. Don't await it here, so this handler
-        # returns quickly and the next incoming update can dispatch.
         runner = asyncio.create_task(_run_and_drain(update, ctx, chat_id, prompt))
         _active_tasks[chat_id] = runner
+
+
+async def _flush_media_group(group_id: str, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Debounce timer fired — assemble the buffered group into a single prompt
+    and dispatch it. The first message in the group is used as the `update`
+    target so the eyeballs/check reaction lands on a stable message id.
+    """
+    await asyncio.sleep(MEDIA_GROUP_DEBOUNCE_SECS)
+    group = _media_groups.pop(group_id, None)
+    if not group:
+        return
+    update = group["first_update"]
+    chat_id = group["chat_id"]
+    user_msg_id = update.message.message_id
+    caption = group["caption"]
+    attachments = group["attachments"]
+    if not caption and not attachments:
+        return
+    prompt = _build_prompt_with_attachments(caption, attachments)
+    try:
+        await _dispatch_prompt(update, ctx, chat_id, user_msg_id, prompt)
+    except Exception:
+        log.exception(f"media-group flush failed for {group_id}")
+
+
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = ctx.bot_data["config"]
+    if not _is_allowed(update, cfg):
+        log.warning(f"Rejected message from user {update.effective_user.id}")
+        return
+
+    msg = update.message
+    if msg is None:
+        return
+
+    # Text body is either .text (pure text) or .caption (media with caption).
+    text = (msg.text or msg.caption or "").strip()
+    chat_id = update.effective_chat.id
+    user_msg_id = msg.message_id
+
+    # Telegram albums: each photo/doc arrives as its own Message sharing a
+    # media_group_id. Buffer them and dispatch one combined prompt so the
+    # user doesn't see N "📥 Queued" replies for a single album.
+    group_id = msg.media_group_id
+    if group_id:
+        attachments = await _download_attachments(update, ctx, Path(cfg.downloads_dir))
+        group = _media_groups.get(group_id)
+        if group is None:
+            group = {
+                "first_update": update,  # anchor for reactions / reply target
+                "chat_id": chat_id,
+                "caption": text,
+                "attachments": list(attachments),
+                "timer": None,
+            }
+            _media_groups[group_id] = group
+        else:
+            group["attachments"].extend(attachments)
+            # Captions can ride on any one message in the group — keep
+            # whichever one we saw a non-empty caption on first.
+            if text and not group["caption"]:
+                group["caption"] = text
+            if group["timer"] and not group["timer"].done():
+                group["timer"].cancel()
+        group["timer"] = asyncio.create_task(_flush_media_group(group_id, ctx))
+        return
+
+    # Download any attachments; inject their paths into the prompt so the
+    # Claude CLI (which can't take attachments in --print mode) can Read them.
+    attachments = await _download_attachments(update, ctx, Path(cfg.downloads_dir))
+    if not text and not attachments:
+        return  # nothing to send
+
+    prompt = _build_prompt_with_attachments(text, attachments)
+    await _dispatch_prompt(update, ctx, chat_id, user_msg_id, prompt)
 
 
 async def _run_and_drain(
