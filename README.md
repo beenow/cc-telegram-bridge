@@ -25,7 +25,7 @@ cc-telegram-bridge is a thin relay. It receives your Telegram message, passes it
 - **ACK reactions** — bot reacts 👀 on receipt and ✅ when the reply completes, so you can see at a glance which messages were handled
 - **Attachments** — send a photo, document, audio file, voice note, or video; the bridge saves it to `downloads/` and tells Claude the path, so Claude's native file tools can read/transcribe/analyze it
 - **Inline model picker** — `/model` with no argument shows one-tap buttons for `sonnet` / `opus` / `haiku`
-- **Message steering** — send a new message while Claude is responding to instantly cancel and redirect (no queue buildup)
+- **Message queue** — send a new message while Claude is responding and it's queued (one slot per chat); runs automatically when the active task finishes
 - **Long response splitting** — responses over Telegram's 4096-char limit are automatically split across multiple messages
 - **Soul / personality layer** — define your assistant's name, tone, and context in `soul.md` — loaded at startup, no code changes needed
 - **Per-chat sessions** — each Telegram chat gets its own Claude session ID stored in local SQLite
@@ -262,8 +262,8 @@ Telegram (your phone)
 │         bridge.py           │
 │   Telegram bot handler      │
 │   - Receives messages       │
-│   - Steering (cancel+replace│
-│     active task on new msg) │
+│   - Queues new msgs while    │
+│     active task runs        │
 │   - Streams replies back    │
 └──────────────┬──────────────┘
                │
