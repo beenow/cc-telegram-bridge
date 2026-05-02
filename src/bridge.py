@@ -895,6 +895,7 @@ def main():
     claude = ClaudeClient(
         system_prompt=cfg.system_prompt,
         model=cfg.default_model,
+        allow_dangerous_tools=cfg.allow_dangerous_tools,
     )
 
     # concurrent_updates=True so a new message can dispatch while a prior

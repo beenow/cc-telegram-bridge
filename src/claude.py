@@ -42,9 +42,10 @@ class StreamChunk:
 
 
 class ClaudeClient:
-    def __init__(self, system_prompt: str = "", model: str = "sonnet"):
+    def __init__(self, system_prompt: str = "", model: str = "sonnet", allow_dangerous_tools: bool = False):
         self._system_prompt = system_prompt
         self._model = model
+        self._allow_dangerous_tools = allow_dangerous_tools
         self._proc: asyncio.subprocess.Process | None = None
 
     def new_session_id(self) -> str:
@@ -193,8 +194,9 @@ class ClaudeClient:
             "--output-format", "stream-json",
             "--verbose",
             "--model", self._model,
-            "--dangerously-skip-permissions",
         ]
+        if self._allow_dangerous_tools:
+            cmd.append("--dangerously-skip-permissions")
 
         if is_new_session:
             cmd += ["--session-id", session_id]

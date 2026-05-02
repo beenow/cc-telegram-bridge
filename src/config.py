@@ -43,6 +43,7 @@ class Config:
 
     # Claude CLI
     default_model: str = "sonnet"
+    allow_dangerous_tools: bool = False
 
     # Trading system integration (optional — disable before open-source publish)
     trading_system_enabled: bool = False
@@ -70,6 +71,7 @@ def load_config() -> Config:
         sys.exit(1)
 
     default_model = _optional("DEFAULT_MODEL", "sonnet")
+    allow_dangerous_tools = _optional_bool("ALLOW_DANGEROUS_TOOLS", False)
     data_dir = _optional("DATA_DIR", "./data")
     log_dir = _optional("LOG_DIR", "./logs")
     downloads_dir = _optional("DOWNLOADS_DIR", "./downloads")
@@ -97,6 +99,7 @@ def load_config() -> Config:
         telegram_bot_token=telegram_bot_token,
         allowed_user_ids=allowed_user_ids,
         default_model=default_model,
+        allow_dangerous_tools=allow_dangerous_tools,
         trading_system_enabled=trading_enabled,
         trading_system_log_dir=trading_log_dir,
         trading_system_config_path=trading_config,
