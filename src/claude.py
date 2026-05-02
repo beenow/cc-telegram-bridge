@@ -22,8 +22,6 @@ log = logging.getLogger(__name__)
 # routes to the wrong binary after a system-wide update.
 # Override with CLAUDE_BIN=/path/to/claude if you need a different install.
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
-MAX_TOOL_ROUNDS = 10  # safety cap (claude CLI handles tools internally, but just in case)
-
 # Tight deadline to receive the first byte from the subprocess.
 # Catches stale --resume sessions that hang while loading large history.
 FIRST_BYTE_TIMEOUT = 30  # seconds
@@ -44,15 +42,9 @@ class StreamChunk:
 
 
 class ClaudeClient:
-    def __init__(self, system_prompt: str = "", model: str = "sonnet", timeout_secs: int = 120):
+    def __init__(self, system_prompt: str = "", model: str = "sonnet"):
         self._system_prompt = system_prompt
         self._model = model
-        # timeout_secs is kept for API compatibility but intentionally NOT used
-        # as a total wall-clock deadline — long agentic runs emit output in
-        # bursts over hours, and a hard total cap would kill them mid-task.
-        # The stream liveness is governed by FIRST_BYTE_TIMEOUT and
-        # INTER_LINE_TIMEOUT instead.
-        self._timeout = timeout_secs
         self._proc: asyncio.subprocess.Process | None = None
 
     def new_session_id(self) -> str:

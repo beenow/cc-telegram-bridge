@@ -47,6 +47,8 @@ cat > "$PLIST_PATH" <<EOF
     <dict>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <key>PATH</key>
+        <string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 
     <key>StandardOutPath</key>

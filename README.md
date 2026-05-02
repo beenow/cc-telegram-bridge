@@ -4,6 +4,8 @@ A lightweight, self-hosted bridge that connects **Telegram** to **Claude Code** 
 
 > Built for personal use. Designed to be open-source.
 
+> **Security note:** The bridge runs Claude with `--dangerously-skip-permissions`, which means anyone in your `ALLOWED_USER_IDS` can trigger arbitrary shell commands and file reads on your Mac via Claude's built-in tools. Your only access control is the Telegram allowlist. If your Telegram account is ever compromised, an attacker has a shell on your machine. Only add user IDs you fully trust, and review `docs/TOOLS.md` to understand what Claude can do by default.
+
 ---
 
 ## How It Works
@@ -86,7 +88,6 @@ ALLOWED_USER_IDS=123456789        # Comma-separated Telegram user IDs
 
 # Optional
 DEFAULT_MODEL=sonnet              # sonnet | opus | haiku
-COMMAND_TIMEOUT_SECS=600          # Max seconds for Claude CLI calls
 DATA_DIR=./data                   # SQLite database location
 LOG_DIR=./logs
 DOWNLOADS_DIR=./downloads         # Where inbound attachments are saved (gitignored)

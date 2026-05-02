@@ -223,7 +223,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # so the session reset isn't shadowed by a still-running task.
     await _cancel_active(chat_id)
     _pending.pop(chat_id, None)
-    db.reset_session(chat_id)
+    await db.reset_session(chat_id)
     await update.message.reply_text("Conversation reset. Starting fresh.")
 
 
@@ -295,7 +295,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update, cfg):
         return
     chat_id = update.effective_chat.id
-    session = db.get_session(chat_id, cfg.default_model, False)
+    session = await db.get_session(chat_id, cfg.default_model)
     has_session = session["claude_session_id"] is not None
     session_str = f"`{session['claude_session_id'][:8]}...`" if has_session else "none (new)"
     text = (
@@ -329,7 +329,7 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     args = ctx.args
 
-    session = db.get_session(chat_id, cfg.default_model, False)
+    session = await db.get_session(chat_id, cfg.default_model)
 
     if not args:
         await update.message.reply_text(
@@ -347,7 +347,7 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    db.set_model(chat_id, model)
+    await db.set_model(chat_id, model)
     await update.message.reply_text(f"Model switched to `{model}`", parse_mode=constants.ParseMode.MARKDOWN)
 
 
@@ -371,7 +371,7 @@ async def cb_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    db.set_model(chat_id, model)
+    await db.set_model(chat_id, model)
     await query.answer(f"Model: {model}")
     try:
         await query.edit_message_text(
@@ -588,19 +588,19 @@ async def _handle_message(
     await ctx.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
 
     # Load or create session
-    session = db.get_session(chat_id, cfg.default_model, False)
+    session = await db.get_session(chat_id, cfg.default_model)
 
     # Determine if this is a new Claude session
     is_new = session["claude_session_id"] is None
     if is_new:
         session_id = claude.new_session_id()
-        db.set_claude_session_id(chat_id, session_id)
+        await db.set_claude_session_id(chat_id, session_id)
     else:
         session_id = session["claude_session_id"]
 
     # Log user message
-    db.log_exchange(chat_id, "user", user_text, session["model"])
-    db.increment_message_count(chat_id)
+    await db.log_exchange(chat_id, "user", user_text, session["model"])
+    await db.increment_message_count(chat_id)
 
     # Send placeholder
     reply_msg = await update.message.reply_text("3 is thinking .")
@@ -742,9 +742,9 @@ async def _handle_message(
             if chunk.error and "no conversation found" in chunk.error.lower() and not is_new:
                 # Session missing from Claude's local store — reset and retry once.
                 log.warning(f"Session {session_id} not found, resetting and retrying...")
-                db.reset_session(chat_id)
+                await db.reset_session(chat_id)
                 session_id = claude.new_session_id()
-                db.set_claude_session_id(chat_id, session_id)
+                await db.set_claude_session_id(chat_id, session_id)
                 is_new = True
                 async for retry_chunk in claude.stream(user_text, session_id, is_new):
                     yield retry_chunk
@@ -856,7 +856,7 @@ async def _handle_message(
 
     # Log assistant response
     if accumulated:
-        db.log_exchange(chat_id, "assistant", accumulated, session["model"])
+        await db.log_exchange(chat_id, "assistant", accumulated, session["model"])
 
     # Swap eyeballs → check mark so the user's message shows "done" at a glance.
     await _set_reaction(ctx, chat_id, user_msg_id, ACK_DONE)
@@ -895,7 +895,6 @@ def main():
     claude = ClaudeClient(
         system_prompt=cfg.system_prompt,
         model=cfg.default_model,
-        timeout_secs=cfg.command_timeout_secs,
     )
 
     # concurrent_updates=True so a new message can dispatch while a prior
@@ -965,7 +964,6 @@ def main():
     log.info("Starting Telegram polling...")
     app.run_polling(drop_pending_updates=True)
 
-    db.close()
     log.info("clawd-bridge stopped.")
 
 
