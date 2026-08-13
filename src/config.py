@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Absolute path, not CWD-relative: as a LaunchDaemon this runs pre-login, where a
+# missed .env would silently fall back to keychain auth that isn't readable yet.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 def _require(key: str) -> str:

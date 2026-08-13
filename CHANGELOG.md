@@ -6,6 +6,12 @@ All notable changes to cc-telegram-bridge are listed here. Patch-level improveme
 
 ## [Unreleased]
 
+### Fixed
+- **`/model` now actually swaps the model** — the per-chat model was stored and displayed but never passed to the Claude subprocess, which always ran on `DEFAULT_MODEL`. The chat's model is now threaded into each turn's `--model`, so a switch takes effect on the very next message (JIT), mid-conversation, with history preserved via `--resume` — no daemon restart.
+
+### Added
+- **`fable` model** — added to the `/model` picker and accepted by `/model <name>` (mapped to `claude-fable-5`).
+
 ---
 
 ## 2026-05-02

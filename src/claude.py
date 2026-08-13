@@ -33,12 +33,26 @@ FIRST_BYTE_TIMEOUT = 30  # seconds
 # silent for this long, we loop back and wait again — no kill.
 READLINE_POLL_SECS = 300  # 5 minutes
 
+# Friendly model names → the exact value the CLI's --model flag needs. Aliases the
+# CLI already resolves to the latest snapshot (sonnet/opus/haiku) pass through
+# untouched; only names the CLI doesn't alias get mapped to a full model id.
+_MODEL_CLI = {"fable": "claude-fable-5"}
+
+
+def _cli_model(name: str) -> str:
+    return _MODEL_CLI.get(name, name)
+
 
 @dataclass
 class StreamChunk:
     text: str = ""
     done: bool = False
     error: str = ""
+    # Authoritative full response from the CLI's terminal `result` event. Used as a
+    # fallback when nothing streamed via `assistant` text blocks (e.g. a turn whose
+    # final answer the CLI only delivers in `result`) — otherwise the reply is lost
+    # and the Telegram placeholder stays stuck on "thinking…".
+    final_text: str = ""
 
 
 class ClaudeClient:
@@ -67,6 +81,7 @@ class ClaudeClient:
         prompt: str,
         session_id: str,
         is_new_session: bool,
+        model: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream a Claude CLI response for a given prompt.
@@ -87,7 +102,7 @@ class ClaudeClient:
           caller should use steering (send a new message) or /new to stop a
           wedged task — we never time-bomb it here.
         """
-        cmd = self._build_command(prompt, session_id, is_new_session)
+        cmd = self._build_command(prompt, session_id, is_new_session, model)
         log.info(f"Running: {' '.join(cmd[:6])}...")
 
         # Declared outside try so except blocks can always reference them safely.
@@ -187,13 +202,18 @@ class ClaudeClient:
         finally:
             self._proc = None
 
-    def _build_command(self, prompt: str, session_id: str, is_new_session: bool) -> list[str]:
+    def _build_command(
+        self, prompt: str, session_id: str, is_new_session: bool, model: str | None = None
+    ) -> list[str]:
+        # Per-call model wins (the chat's /model choice), falling back to the client
+        # default. Passed per turn — never stored on self — so concurrent chats with
+        # different models don't stomp each other's subprocess.
         cmd = [
             CLAUDE_BIN,
             "--print",
             "--output-format", "stream-json",
             "--verbose",
-            "--model", self._model,
+            "--model", _cli_model(model or self._model),
         ]
         if self._allow_dangerous_tools:
             cmd.append("--dangerously-skip-permissions")
@@ -244,7 +264,7 @@ class ClaudeClient:
                 errors = data.get("errors") or []
                 msg = "; ".join(str(e) for e in errors) if errors else data.get("result") or ""
                 return StreamChunk(error=msg or "Unknown error from Claude CLI")
-            return StreamChunk(done=True)
+            return StreamChunk(done=True, final_text=data.get("result") or "")
 
         elif event_type == "system":
             # Log the session_id from init event so we can verify

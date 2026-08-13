@@ -26,12 +26,12 @@ cc-telegram-bridge is a thin relay. It receives your Telegram message, passes it
 - **Animated thinking indicator** — "3 is thinking ." cycles up to 50 dots while waiting for the first response chunk
 - **ACK reactions** — bot reacts 👀 on receipt and ✅ when the reply completes, so you can see at a glance which messages were handled
 - **Attachments** — send a photo, document, audio file, voice note, or video; the bridge saves it to `downloads/` and tells Claude the path, so Claude's native file tools can read/transcribe/analyze it
-- **Inline model picker** — `/model` with no argument shows one-tap buttons for `sonnet` / `opus` / `haiku`
+- **Inline model picker** — `/model` with no argument shows one-tap buttons for `sonnet` / `opus` / `haiku` / `fable`; the switch applies to your next message (history is kept via `--resume`)
 - **Message queue** — send a new message while Claude is responding and it's queued (one slot per chat); runs automatically when the active task finishes
 - **Long response splitting** — responses over Telegram's 4096-char limit are automatically split across multiple messages
 - **Soul / personality layer** — define your assistant's name, tone, and context in `soul.md` — loaded at startup, no code changes needed
 - **Per-chat sessions** — each Telegram chat gets its own Claude session ID stored in local SQLite
-- **Multi-model** — switch between `sonnet`, `opus`, and `haiku` per session with `/model`
+- **Multi-model** — switch between `sonnet`, `opus`, `haiku`, and `fable` per chat with `/model`; the next turn runs on the new model, mid-conversation, no restart
 - **Allowlist** — restrict access to specific Telegram user IDs
 - **Mac-native daemon** — runs as a launchd service, auto-starts on login, auto-restarts on crash
 - **No API key needed** — uses your existing Claude Code subscription
@@ -87,7 +87,7 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 ALLOWED_USER_IDS=123456789        # Comma-separated Telegram user IDs
 
 # Optional
-DEFAULT_MODEL=sonnet              # sonnet | opus | haiku
+DEFAULT_MODEL=sonnet              # sonnet | opus | haiku | fable
 DATA_DIR=./data                   # SQLite database location
 LOG_DIR=./logs
 DOWNLOADS_DIR=./downloads         # Where inbound attachments are saved (gitignored)
@@ -144,7 +144,7 @@ If Claude is mid-response and you send another message, the current task **keeps
 | `/start` | Introduction and help |
 | `/new` | Start a fresh conversation (cancels any active task, drops queue, clears session) |
 | `/model` | Show one-tap inline keyboard to switch model |
-| `/model <name>` | Switch model directly — `sonnet`, `opus`, or `haiku` |
+| `/model <name>` | Switch model directly — `sonnet`, `opus`, `haiku`, or `fable` (applies next message) |
 | `/ping` | Check if a long task is still running and whether a message is queued |
 | `/stop` | Cancel the current task (and drop any queued message) |
 | `/status` | Show current session info (model, message count, session ID) |

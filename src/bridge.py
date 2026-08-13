@@ -306,7 +306,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=constants.ParseMode.MARKDOWN)
 
 
-VALID_MODELS = ["sonnet", "opus", "haiku"]
+VALID_MODELS = ["sonnet", "opus", "haiku", "fable"]
 
 
 def _model_keyboard(current: str) -> InlineKeyboardMarkup:
@@ -348,7 +348,10 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await db.set_model(chat_id, model)
-    await update.message.reply_text(f"Model switched to `{model}`", parse_mode=constants.ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"Model set to `{model}` — applies to your next message (history is kept).",
+        parse_mode=constants.ParseMode.MARKDOWN,
+    )
 
 
 async def cb_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -375,7 +378,7 @@ async def cb_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer(f"Model: {model}")
     try:
         await query.edit_message_text(
-            f"Model switched to `{model}`",
+            f"Model set to `{model}` — applies to your next message (history is kept).",
             parse_mode=constants.ParseMode.MARKDOWN,
             reply_markup=_model_keyboard(model),
         )
@@ -733,8 +736,14 @@ async def _handle_message(
         """
         nonlocal session_id, is_new
 
+        # The chat's current model (set via /model, stored per-chat in the DB and
+        # re-read at the top of every turn) is passed to each subprocess — so a
+        # switch takes effect on the very next message, JIT, with history intact
+        # via --resume. No daemon restart, no new session.
+        model = session["model"]
+
         async def _do_stream():
-            async for chunk in claude.stream(user_text, session_id, is_new):
+            async for chunk in claude.stream(user_text, session_id, is_new, model=model):
                 yield chunk
 
         first_error = None
@@ -746,7 +755,7 @@ async def _handle_message(
                 session_id = claude.new_session_id()
                 await db.set_claude_session_id(chat_id, session_id)
                 is_new = True
-                async for retry_chunk in claude.stream(user_text, session_id, is_new):
+                async for retry_chunk in claude.stream(user_text, session_id, is_new, model=model):
                     yield retry_chunk
                 return
             yield chunk
@@ -781,6 +790,10 @@ async def _handle_message(
                 await _edit()
 
             if chunk.done:
+                # Fallback: if nothing streamed as `assistant` text, use the CLI's
+                # authoritative `result` text so the reply isn't silently lost.
+                if chunk.final_text and not accumulated:
+                    accumulated = chunk.final_text
                 break
 
     except asyncio.CancelledError:
@@ -851,8 +864,18 @@ async def _handle_message(
                         )
                     else:
                         await ctx.bot.send_message(chat_id=chat_id, text=part)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"Final send failed for part {i}: {e}")
+    else:
+        # Nothing to show (no stream text AND no result text) — replace the
+        # placeholder so it never sits frozen on the last "thinking…" frame.
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id, message_id=reply_id, text="_(no response)_",
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
 
     # Log assistant response
     if accumulated:
