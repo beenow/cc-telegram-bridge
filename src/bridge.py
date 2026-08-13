@@ -7,6 +7,7 @@ Run with:
 
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import re
 import sys
 import time
@@ -389,7 +390,11 @@ async def cb_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Message handler ──────────────────────────────────────────────────────────
 
 EDIT_INTERVAL_CHARS = 120
-EDIT_MIN_SECS = 0.8
+# Telegram tolerates roughly 20 edits per minute to one chat before it starts
+# answering with RetryAfter. At 0.8s this allowed ~75/min, so a single long
+# streaming answer could trip the limit on its own — the animation was merely
+# the loudest offender. 3s keeps the stream visibly live inside the budget.
+EDIT_MIN_SECS = 3.0
 TG_MAX_LEN = 4096  # Telegram hard limit per message
 
 
@@ -605,13 +610,35 @@ async def _handle_message(
     await db.log_exchange(chat_id, "user", user_text, session["model"])
     await db.increment_message_count(chat_id)
 
-    # Send placeholder
-    reply_msg = await update.message.reply_text("3 is thinking .")
+    # Send placeholder.
+    #
+    # A RetryAfter here used to kill `_handle_message` outright: the user's
+    # message was consumed, the offset advanced, and no answer ever arrived —
+    # indistinguishable from a hang, and the only visible symptom of the
+    # animation below having burned the chat's quota.
+    #
+    # Ten call sites downstream edit this message, so it cannot be None; a
+    # short penalty is therefore waited out rather than skipped. A LONG one is
+    # re-raised: nothing can be delivered to this chat for hours, and failing
+    # loudly in the log beats a worker sleeping on it.
+    try:
+        reply_msg = await update.message.reply_text("3 is thinking .")
+    except RetryAfter as exc:
+        wait = float(getattr(exc, "retry_after", 0) or 0)
+        log.warning("rate limited sending placeholder; retry_after=%ss", wait)
+        if wait > 30:
+            raise
+        await asyncio.sleep(wait + 1)
+        reply_msg = await update.message.reply_text("3 is thinking .")
     reply_id = reply_msg.message_id
 
     accumulated = ""
     last_edit_len = 0
     last_edit_time = time.monotonic()
+    # Set once Telegram rate-limits a streaming edit. Further edits are then
+    # skipped for the rest of the turn: the reply still arrives in full via the
+    # final send, and asking again while penalised is what escalates the ban.
+    edits_rate_limited = False
     first_chunk_received = False
     task_complete = False
     task_started = time.monotonic()
@@ -622,14 +649,28 @@ async def _handle_message(
         "bytes_streamed": 0,
     }
 
-    # Animated thinking indicator — cycles until first real text arrives
-    _THINKING_FRAMES = [f"3 is thinking {'.' * i}" for i in range(1, 51)]
+    # Animated thinking indicator — cycles until first real text arrives.
+    #
+    # EVERY EDIT COSTS TELEGRAM QUOTA. This ran every 0.6s for as long as the
+    # model was thinking: a 30-second answer is ~50 edits of one message, and a
+    # handful of those in a row exhausts the per-chat budget. Telegram then
+    # answers everything — including the NEXT turn's placeholder — with
+    # RetryAfter, and the penalty escalates the longer it continues. Observed
+    # escalation in this log: 5s, 20s, 167s, 546s, 653s, 782s, then 41039s.
+    # Eleven hours of the bot appearing hung, from an animation.
+    #
+    # So: a slow cadence, and a hard cap. After the cap the placeholder simply
+    # sits there saying it is working, which conveys the same thing at no cost.
+    # The heartbeat below already covers genuinely long tasks.
+    _THINKING_FRAMES = [f"3 is thinking {'.' * i}" for i in range(1, 4)]
+    _THINKING_INTERVAL_SECS = 4.0
+    _THINKING_MAX_EDITS = 6          # ~24s of animation, then it rests
     _thinking_frame = 0
 
     async def _animate_thinking():
         nonlocal _thinking_frame
-        while not first_chunk_received:
-            await asyncio.sleep(0.6)
+        while not first_chunk_received and _thinking_frame < _THINKING_MAX_EDITS:
+            await asyncio.sleep(_THINKING_INTERVAL_SECS)
             if first_chunk_received:
                 break
             frame = _THINKING_FRAMES[_thinking_frame % len(_THINKING_FRAMES)]
@@ -640,6 +681,11 @@ async def _handle_message(
                     message_id=reply_id,
                     text=frame,
                 )
+            except RetryAfter:
+                # Already rate-limited: stop editing entirely rather than keep
+                # asking. Continuing is what turns a 20-second penalty into an
+                # eleven-hour one.
+                return
             except Exception:
                 pass
 
@@ -684,7 +730,9 @@ async def _handle_message(
             return
 
     async def _edit(force: bool = False):
-        nonlocal last_edit_len, last_edit_time
+        nonlocal last_edit_len, last_edit_time, edits_rate_limited
+        if edits_rate_limited:
+            return
         now = time.monotonic()
         if not force:
             if len(accumulated) - last_edit_len < EDIT_INTERVAL_CHARS:
@@ -703,6 +751,14 @@ async def _handle_message(
             )
             last_edit_len = len(accumulated)
             last_edit_time = now
+        except RetryAfter as e:
+            # Stop streaming edits for this turn. `_edit` is called once per
+            # ~120 chars, so a long answer issues dozens of them; retrying each
+            # one while already penalised is exactly how a short penalty grows
+            # into an eleven-hour one. The final send still delivers the text.
+            edits_rate_limited = True
+            log.warning("rate limited mid-stream; stopping live edits (retry_after=%ss)",
+                        getattr(e, "retry_after", "?"))
         except BadRequest as e:
             msg = str(e).lower()
             if "message is not modified" in msg:
@@ -893,7 +949,16 @@ def setup_logging(log_dir: str, log_level: str):
     # Only a FileHandler: launchd already redirects stdout to bridge.log via
     # StandardOutPath, so adding a StreamHandler(stdout) would write every
     # line twice.
-    handlers = [logging.FileHandler(str(Path(log_dir) / "bridge.log"))]
+    # ROTATING, not append-forever. bridge.log had reached 379MB: three DEBUG
+    # lines every 10 seconds, kept since July. 5 × 20MB bounds it at 100MB and
+    # keeps roughly a week of INFO, which is what anyone actually reads back.
+    handlers = [
+        RotatingFileHandler(
+            str(Path(log_dir) / "bridge.log"),
+            maxBytes=20 * 1024 * 1024,
+            backupCount=5,
+        )
+    ]
     # force=True removes any handlers already on the root logger (prevents
     # duplicate log lines when the process is restarted by launchd).
     logging.basicConfig(
@@ -903,7 +968,11 @@ def setup_logging(log_dir: str, log_level: str):
         force=True,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.DEBUG)
+    # Honour LOG_LEVEL rather than pinning the library to DEBUG. Hardcoded, it
+    # overrode LOG_LEVEL=INFO and logged every 10-second getUpdates poll — three
+    # lines a poll, ~26,000 lines a day, and the reason the log reached 379MB.
+    # It also buried the RetryAfter errors that mattered.
+    logging.getLogger("telegram").setLevel(level)
 
 
 def main():
